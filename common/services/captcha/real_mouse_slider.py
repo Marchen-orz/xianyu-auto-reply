@@ -5,8 +5,8 @@
 - 闲鱼/阿里 baxia 风控能区分「CDP 注入的鼠标事件」与「真实硬件鼠标事件」。
   实测：Playwright(CDP) 即使回放真人轨迹也被判 code=300（拒），而用 pyautogui 驱动
   物理光标回放同一条真人轨迹则 code=0（通过）。
-- 因此本引擎用 pyautogui 驱动**物理光标**，回放预先录制的真人滑动轨迹，
-  完成 NC 滑块验证；登录场景复用业务滑块同一套回放逻辑，仅使用登录专用长位移样本。
+- 因此业务场景用 SendInput、登录场景用 pyautogui 驱动物理光标，回放预先录制的真人轨迹，
+  完成 NC 滑块验证；登录场景继续使用登录专用长位移样本和原有回放逻辑。
 
 代价与限制：
 - 运行期间会**接管桌面物理光标约 2~3 秒**，期间人不能同时用鼠标；
@@ -19,16 +19,18 @@
 """
 from __future__ import annotations
 
+import atexit
 import glob
 import json
 import os
 import random
-import shutil
 import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 from loguru import logger
 
@@ -37,6 +39,12 @@ from common.services.captcha.weighted_scheduler import real_mouse_scheduler
 from common.services.captcha.windows_foreground import (
     activate_page_window,
     activate_window,
+)
+from common.services.captcha.win_input import (
+    precise_sleep,
+    send_button,
+    send_move_abs,
+    timer_resolution,
 )
 
 from playwright.sync_api import sync_playwright
@@ -53,6 +61,11 @@ except Exception as _e:  # noqa: BLE001  （任何导入异常都视为不可用
     REAL_MOUSE_AVAILABLE = False
     logger.warning(f"真实鼠标引擎不可用（pyautogui 导入失败，将回退原逻辑）: {_e}")
 
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None  # type: ignore
+
 
 # 物理光标全局唯一 → 串行执行。
 # 串行由 real_mouse_scheduler（加权公平单槽位调度器）保证：多来源同时排队时按权重放行，
@@ -60,6 +73,13 @@ except Exception as _e:  # noqa: BLE001  （任何导入异常都视为不可用
 
 # 风控未放行的 URL 关键字
 _PUNISH = ("punish", "x5step=2", "action=captcha", "pureCaptcha", "/captcha")
+_MAX_ANCHOR_GAP_MS = 180.0
+_MAX_REPLAY_DURATION_MS = 2600.0
+# 真人鼠标模式专用固定目录：本地与远程请求共用，用于复用和精确识别 Chrome 进程。
+_REAL_MOUSE_BROWSER_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "browser_data", "real_mouse_shared")
+)
+_REAL_MOUSE_BROWSER_LOCK = os.path.join(_REAL_MOUSE_BROWSER_DIR, "browser.lock")
 
 # 仅隐藏 webdriver，绝不伪造与真实 Chrome 冲突的指纹（UA/WebGL 交给真实 Chrome）
 _STEALTH_MINIMAL = """
@@ -136,11 +156,33 @@ def _load_drags(scene: str = "business") -> List[List[Tuple[float, float, float]
         seg = [e for e in moves if len(e) >= 5 and e[4] == 1]
         if len(seg) < 5:
             continue
+        if scene == "business":
+            while len(seg) > 2:
+                gap = seg[-1][3] - seg[-2][3]
+                dx = seg[-1][1] - seg[-2][1]
+                dy = seg[-1][2] - seg[-2][2]
+                if gap > 250.0 and abs(dx) <= 1.0 and abs(dy) <= 1.0:
+                    seg.pop()
+                    continue
+                break
         x0, y0, prev = seg[0][1], seg[0][2], seg[0][3]
+        raw_duration_ms = max(0.0, seg[-1][3] - seg[0][3])
+        if scene == "business" and raw_duration_ms > _MAX_REPLAY_DURATION_MS:
+            continue
         rel: List[Tuple[float, float, float]] = []
         for p in seg:
-            rel.append((p[1] - x0, p[2] - y0, p[3] - prev))
+            dt = max(0.0, p[3] - prev)
+            if scene == "business":
+                dt = min(_MAX_ANCHOR_GAP_MS, dt)
+            rel.append((p[1] - x0, p[2] - y0, dt))
             prev = p[3]
+        if scene == "business":
+            duration_ms = sum(point[2] for point in rel)
+            distance = rel[-1][0]
+            if len(rel) < 20 or duration_ms < 350 or duration_ms > _MAX_REPLAY_DURATION_MS:
+                continue
+            if distance < 120 or distance > 1200:
+                continue
         drags.append(rel)
     return drags
 
@@ -174,7 +216,7 @@ def _choose_drag(drags: List[List[Tuple[float, float, float]]]) -> List[Tuple[fl
 
 
 class _RealMouseSolver:
-    """单次真实鼠标滑块求解（自建浏览器、自然指纹）。"""
+    """可复用真实鼠标滑块求解器（固定浏览器目录、自然指纹）。"""
 
     def __init__(self, user_id: str):
         self.user_id = str(user_id)
@@ -182,30 +224,40 @@ class _RealMouseSolver:
         self.pw = None
         self.context = None
         self.page = None
-        # 一次性 profile 目录（每次唯一并在 close 时删除），彻底规避同账号复用导致的 PROFILE_IN_USE
-        self.user_data_dir = os.path.join(
-            os.getcwd(), "browser_data", f"realmouse_{self.pure_id}_{int(time.time() * 1000)}"
-        )
-        os.makedirs(self.user_data_dir, exist_ok=True)
+        self.browser_dir = _REAL_MOUSE_BROWSER_DIR
+        os.makedirs(self.browser_dir, exist_ok=True)
+        self._browser_lock_file = None
         self._slide_code: Optional[int] = None
         self._timed_out = False
         self._window_handle: Optional[int] = None
 
     # ---------- 浏览器 ----------
+    def update_user(self, user_id: str) -> None:
+        """更新当前任务日志标识，不改变共享浏览器实例。"""
+        self.user_id = str(user_id)
+        self.pure_id = self.user_id.split("_")[0] if "_" in self.user_id else self.user_id
+
     def init_browser(self) -> None:
-        self.pw = sync_playwright().start()
-        self.context = self.pw.chromium.launch_persistent_context(
-            self.user_data_dir,
-            channel="chrome",          # 用本机真实 Chrome（自然指纹），非自带 Chromium
-            headless=False,            # 真实鼠标必须有可见窗口
-            args=_BROWSER_ARGS,
-            no_viewport=True,          # 不强制 viewport，保留真实窗口尺寸
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-            ignore_https_errors=True,
-            extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
-            timeout=30000,
-        )
+        self._acquire_browser_lock()
+        # 当前进程没有可用上下文时，先清理固定目录对应的孤儿 Chrome。
+        self._kill_browser_processes(log_result=False)
+        try:
+            self.pw = sync_playwright().start()
+            self.context = self.pw.chromium.launch_persistent_context(
+                self.browser_dir,
+                channel="chrome",          # 用本机真实 Chrome（自然指纹），非自带 Chromium
+                headless=False,            # 真实鼠标必须有可见窗口
+                args=_BROWSER_ARGS,
+                no_viewport=True,          # 不强制 viewport，保留真实窗口尺寸
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+                ignore_https_errors=True,
+                extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+                timeout=30000,
+            )
+        except Exception:
+            self._release_browser_lock()
+            raise
         self.context.add_init_script(_STEALTH_MINIMAL)
         self.context.add_init_script(_CAP_JS)
 
@@ -219,8 +271,138 @@ class _RealMouseSolver:
                 pass
 
         self.context.on("response", _on_resp)
-        self.page = self.context.new_page()
+        pages = list(self.context.pages)
+        self.page = pages[0] if pages else self.context.new_page()
+        for extra_page in pages[1:]:
+            try:
+                extra_page.close()
+            except Exception:
+                pass
         self.page.bring_to_front()
+
+    def _acquire_browser_lock(self) -> None:
+        """跨进程独占固定浏览器目录，防止多个服务进程同时启动真人鼠标 Chrome。"""
+        if self._browser_lock_file is not None:
+            return
+        if sys.platform != "win32" or msvcrt is None:
+            return
+        lock_file = open(_REAL_MOUSE_BROWSER_LOCK, "a+b")
+        try:
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"0")
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as e:
+            lock_file.close()
+            raise RuntimeError("真人鼠标共享浏览器已被另一个服务进程占用") from e
+        self._browser_lock_file = lock_file
+
+    def _release_browser_lock(self) -> None:
+        """释放真人鼠标固定浏览器目录的跨进程锁。"""
+        lock_file = self._browser_lock_file
+        self._browser_lock_file = None
+        if lock_file is None:
+            return
+        try:
+            lock_file.seek(0)
+            if sys.platform == "win32" and msvcrt is not None:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        try:
+            lock_file.close()
+        except Exception:
+            pass
+
+    def ensure_browser(self) -> None:
+        """确认共享 Chrome/Context/Page 可用，失效时自动完整重启。"""
+        context_ok = False
+        try:
+            if self.context is not None:
+                _ = self.context.pages
+                context_ok = True
+        except Exception:
+            context_ok = False
+        if context_ok:
+            try:
+                if self.page is None or self.page.is_closed():
+                    self.page = self.context.new_page()
+                for extra_page in list(self.context.pages):
+                    if extra_page is not self.page:
+                        extra_page.close()
+                self.page.evaluate("() => 1")
+                return
+            except Exception:
+                pass
+        self.close()
+        self.init_browser()
+
+    def prepare_task(self, user_id: str, url: str) -> None:
+        """复用浏览器前清理上一任务状态，防止本地/远程或账号之间串 Cookie。"""
+        self.update_user(user_id)
+        self._slide_code = None
+        self._timed_out = False
+        self._window_handle = None
+        last_error: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                self.ensure_browser()
+                self._prepare_clean_page(url)
+                return
+            except Exception as e:
+                last_error = e
+                if attempt == 0:
+                    logger.warning(
+                        f"【{self.pure_id}】共享浏览器状态清理失败，将重启后重试: {e}"
+                    )
+                self.close()
+        raise RuntimeError(f"共享浏览器重启后仍无法清理任务状态: {last_error}") from last_error
+
+    def _prepare_clean_page(self, url: str) -> None:
+        """在当前共享 Context 中创建唯一干净页面，并确认无历史 Cookie。"""
+        new_page = self.context.new_page()
+        for old_page in list(self.context.pages):
+            if old_page is not new_page:
+                old_page.close()
+        self.page = new_page
+        # 先关闭旧页面，避免尾部响应在首次清理后重新写入 Cookie。
+        self.context.clear_cookies()
+        remaining = self.context.cookies()
+        if remaining:
+            raise RuntimeError(f"关闭旧页面后仍残留 {len(remaining)} 个 Cookie")
+        self._clear_browser_storage(url)
+        # 存储清理后再次清 Cookie 并校验，任何残留都触发浏览器重启。
+        self.context.clear_cookies()
+        remaining = self.context.cookies()
+        if remaining:
+            raise RuntimeError(f"二次清理后仍残留 {len(remaining)} 个 Cookie")
+        if len(self.context.pages) != 1:
+            raise RuntimeError(f"共享浏览器页面数量异常: {len(self.context.pages)}")
+        self.page.bring_to_front()
+
+    def _clear_browser_storage(self, url: str) -> None:
+        """清理缓存及闲鱼相关 Origin 存储，避免固定 Context 残留上一次任务状态。"""
+        origins = {
+            "https://h5api.m.goofish.com",
+            "https://passport.goofish.com",
+            "https://www.goofish.com",
+            "https://m.goofish.com",
+        }
+        parsed = urlsplit(url or "")
+        if parsed.scheme and parsed.netloc:
+            origins.add(f"{parsed.scheme}://{parsed.netloc}")
+        try:
+            session = self.context.new_cdp_session(self.page)
+            session.send("Network.clearBrowserCache")
+            for origin in origins:
+                session.send(
+                    "Storage.clearDataForOrigin",
+                    {"origin": origin, "storageTypes": "all"},
+                )
+        except Exception as e:
+            raise RuntimeError(f"清理共享浏览器站点存储失败: {e}") from e
 
     def close(self) -> None:
         for fn in (
@@ -232,36 +414,41 @@ class _RealMouseSolver:
                 fn()
             except Exception:
                 pass
-        # 删除一次性 profile 目录
-        try:
-            shutil.rmtree(self.user_data_dir, ignore_errors=True)
-        except Exception:
-            pass
+        self.page = None
+        self.context = None
+        self.pw = None
+        self._release_browser_lock()
 
     def force_kill(self) -> None:
-        """看门狗超时回调：按本次唯一 user_data_dir 精确强杀对应 Chrome 进程。
+        """看门狗超时回调：按真人鼠标固定目录精确强杀对应 Chrome 进程。
 
-        仅匹配命令行包含本次 user_data_dir 的进程，绝不误伤用户自己的 Chrome。
+        仅匹配命令行包含真人鼠标固定目录的进程，绝不误伤用户自己的 Chrome。
         强杀后，solve()/close() 中阻塞的 Playwright 调用会立即抛错返回，
         从而保证 run_real_mouse_verification 一定返回、上层风控日志不再卡在“处理中”。
         """
         self._timed_out = True
+        self._kill_browser_processes(log_result=True)
+
+    def _kill_browser_processes(self, log_result: bool) -> None:
+        """按固定目录清理真人鼠标 Chrome 主进程和子进程。"""
         if sys.platform != "win32":
             return
         try:
-            udir = self.user_data_dir
+            browser_dir = self.browser_dir
             ps = (
                 "Get-CimInstance Win32_Process | "
-                f"Where-Object {{ $_.CommandLine -like '*{udir}*' }} | "
+                f"Where-Object {{ $_.Name -eq 'chrome.exe' -and $_.CommandLine -like '*{browser_dir}*' }} | "
                 "ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }"
             )
             subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                 capture_output=True, timeout=15,
             )
-            logger.warning(f"【{self.pure_id}】真实鼠标引擎超时，已强杀本次浏览器进程")
+            if log_result:
+                logger.warning(f"【{self.pure_id}】真实鼠标引擎超时，已强杀共享浏览器进程")
         except Exception as e:
-            logger.warning(f"【{self.pure_id}】真实鼠标引擎强杀浏览器失败（可忽略）: {e}")
+            if log_result:
+                logger.warning(f"【{self.pure_id}】真实鼠标引擎强杀共享浏览器失败（可忽略）: {e}")
 
     # ---------- 工具 ----------
     def _cookies(self) -> Dict[str, str]:
@@ -314,8 +501,9 @@ class _RealMouseSolver:
         except Exception as e:
             logger.warning(f"【{self.pure_id}】强制最大化窗口失败（继续）: {e}")
 
-    def _ensure_login_window_foreground(self) -> bool:
-        """激活本次登录验证 Chrome，并校验物理输入的真实前台归属。"""
+    def _ensure_window_foreground(self, scene: str) -> bool:
+        """激活当前验证 Chrome，并校验物理输入的真实前台归属。"""
+        scene_name = "登录滑块" if scene == "login" else "业务滑块"
         try:
             self.page.bring_to_front()
             if self._window_handle:
@@ -328,16 +516,16 @@ class _RealMouseSolver:
                 self._window_handle = hwnd
                 if first_detection:
                     logger.info(
-                        f"【{self.pure_id}】登录滑块已锁定 Windows 前台窗口: {detail}"
+                        f"【{self.pure_id}】{scene_name}已锁定 Windows 前台窗口: {detail}"
                     )
                 return True
             logger.error(
-                f"【{self.pure_id}】登录滑块无法激活 Windows 前台窗口，"
+                f"【{self.pure_id}】{scene_name}无法激活 Windows 前台窗口，"
                 f"已取消物理鼠标回放: {detail}"
             )
         except Exception as e:
             logger.error(
-                f"【{self.pure_id}】登录滑块 Windows 前台校验异常，"
+                f"【{self.pure_id}】{scene_name} Windows 前台校验异常，"
                 f"已取消物理鼠标回放: {e}"
             )
         return False
@@ -351,11 +539,11 @@ class _RealMouseSolver:
         scene: str = "business",
     ) -> Tuple[bool, Optional[Dict[str, str]]]:
         start = time.time()
-        self.init_browser()
+        self.ensure_browser()
         # 登录场景强制最大化（业务场景保持原有窗口行为不变）
         if scene == "login":
             self._maximize_window()
-            self._ensure_login_window_foreground()
+            self._ensure_window_foreground(scene)
 
         # 导航（命中过期页则用 url_provider 刷新一次）
         target = url
@@ -367,7 +555,7 @@ class _RealMouseSolver:
             time.sleep(random.uniform(1.2, 1.8))
             if scene == "login":
                 self._maximize_window()
-                self._ensure_login_window_foreground()
+                self._ensure_window_foreground(scene)
             try:
                 content = self.page.content()
             except Exception:
@@ -415,14 +603,14 @@ class _RealMouseSolver:
                 logger.warning(f"【{self.pure_id}】真实鼠标引擎未找到滑块（第{attempt}次尝试）")
                 break
 
-            # pyautogui 发送的是系统级输入，必须确认本次 Chrome 是 Windows 真实前台窗口。
+            # SendInput/pyautogui 都是系统级输入，必须确认本次 Chrome 是 Windows 真实前台窗口。
             if scene == "login":
                 self._maximize_window()
-                if not self._ensure_login_window_foreground():
-                    return False, None
+            if not self._ensure_window_foreground(scene):
+                return False, None
 
             # 计算坐标 + 物理鼠标回放真人轨迹（每次随机挑一条轨迹，降低重复模式风险）
-            selected_drag = _choose_drag(drags) if scene == "login" else random.choice(drags)
+            selected_drag = _choose_drag(drags)
             if scene == "login":
                 logger.info(
                     f"【{self.pure_id}】登录滑块回放真人原始样本: "
@@ -430,6 +618,13 @@ class _RealMouseSolver:
                     f"位移={selected_drag[-1][0]:.0f}px, "
                     f"按下至末点={sum(point[2] for point in selected_drag):.0f}ms, "
                     f"首点等待={selected_drag[1][2]:.0f}ms"
+                )
+            else:
+                logger.info(
+                    f"【{self.pure_id}】业务滑块第{attempt}次选用真人轨迹: "
+                    f"点数={len(selected_drag)}, "
+                    f"位移={selected_drag[-1][0]:.0f}px, "
+                    f"时长={sum(point[2] for point in selected_drag):.0f}ms"
                 )
             if not self._do_real_slide(
                 frame,
@@ -450,10 +645,31 @@ class _RealMouseSolver:
                 # （是否回退原引擎由编排层根据 CAPTCHA_REAL_MOUSE 决定，本引擎只负责返回结果）
                 return (True, cookies) if cookies else (False, None)
 
-            # 本次未过：若还有重试机会且时间充足，点“重试”按钮重置滑块后再滑
+            # 本次未过：业务远程调用优先重新获取新鲜 URL，避免在已被风控拒绝的旧页面上
+            # 连续重复轨迹；login 或没有 URL 刷新能力时，保持原页面点击重试逻辑。
             if attempt < max_attempts and (time.time() - start) < (browser_timeout - 5):
-                logger.info(f"【{self.pure_id}】真实鼠标引擎第{attempt}次未通过，点击重试后再滑")
-                self._click_retry()
+                logger.info(f"【{self.pure_id}】真实鼠标引擎第{attempt}次未通过，准备刷新或重试")
+                refreshed = False
+                if scene == "business" and url_provider is not None:
+                    try:
+                        fresh = url_provider()
+                    except Exception as refresh_error:
+                        logger.warning(f"【{self.pure_id}】失败后刷新验证链接异常，沿用当前页面: {refresh_error}")
+                        fresh = None
+                    if fresh == CAPTCHA_NOT_REQUIRED:
+                        logger.info(f"【{self.pure_id}】失败后刷新 token 已可用，无需继续滑块")
+                        return True, None
+                    if isinstance(fresh, str) and fresh:
+                        try:
+                            self.page.goto(fresh, wait_until="domcontentloaded", timeout=15000)
+                            time.sleep(random.uniform(1.2, 1.8))
+                            if "抱歉，页面访问出现了问题" not in self.page.content():
+                                refreshed = True
+                                logger.info(f"【{self.pure_id}】失败后已切换到新鲜验证链接重试")
+                        except Exception as refresh_error:
+                            logger.warning(f"【{self.pure_id}】失败后导航新验证链接异常，沿用当前页面: {refresh_error}")
+                if not refreshed:
+                    self._click_retry()
                 time.sleep(random.uniform(1.0, 1.8))
                 continue
             break
@@ -481,34 +697,49 @@ class _RealMouseSolver:
                     mx = candidate_x
         dpr = self.page.evaluate("() => window.devicePixelRatio") or 1.0
 
-        # 校准：主视口坐标 -> 屏幕坐标 的平移量
-        try:
-            frame.evaluate("() => { window.__cal = []; }")
-        except Exception:
-            pass
-        self.page.mouse.move(mx, my, steps=3)
-        time.sleep(0.2)
-        cal = []
-        try:
-            cal = frame.evaluate("() => window.__cal || []") or self.page.evaluate("() => window.__cal || []")
-        except Exception:
-            pass
-        if not cal:
-            logger.warning(f"【{self.pure_id}】真实鼠标引擎坐标校准失败")
-            return False
-        c = cal[-1]
-        off_x, off_y = c[2] - mx, c[3] - my
+        if scene == "business":
+            # 业务滑块避免用 page.mouse.move 注入一次 CDP 合成移动事件；通过真实窗口几何关系
+            # 完成 CSS 视口坐标到物理屏幕坐标的映射，与测试目录验证通过的 raw 模式一致。
+            geometry = self.page.evaluate(
+                "() => ({sx: window.screenX, sy: window.screenY, ow: window.outerWidth, "
+                "oh: window.outerHeight, iw: window.innerWidth, ih: window.innerHeight})"
+            )
+            border_x = max(0.0, (geometry["ow"] - geometry["iw"]) / 2.0)
+            top_chrome = max(0.0, (geometry["oh"] - geometry["ih"]) - border_x)
+            off_x = geometry["sx"] + border_x
+            off_y = geometry["sy"] + top_chrome
 
-        def to_screen(vx: float, vy: float) -> Tuple[int, int]:
-            return int(round((vx + off_x) * dpr)), int(round((vy + off_y) * dpr))
+            def to_screen(vx: float, vy: float) -> Tuple[int, int]:
+                return int(round((off_x + vx) * dpr)), int(round((off_y + vy) * dpr))
+        else:
+            # 登录滑块保持原 CDP 校准逻辑，不改变 login 的滑动行为。
+            try:
+                frame.evaluate("() => { window.__cal = []; }")
+            except Exception:
+                pass
+            self.page.mouse.move(mx, my, steps=3)
+            time.sleep(0.2)
+            cal = []
+            try:
+                cal = frame.evaluate("() => window.__cal || []") or self.page.evaluate("() => window.__cal || []")
+            except Exception:
+                pass
+            if not cal:
+                logger.warning(f"【{self.pure_id}】真实鼠标引擎坐标校准失败")
+                return False
+            c = cal[-1]
+            off_x, off_y = c[2] - mx, c[3] - my
+
+            def to_screen(vx: float, vy: float) -> Tuple[int, int]:
+                return int(round((vx + off_x) * dpr)), int(round((vy + off_y) * dpr))
 
         self._slide_code = None  # 每次滑动前重置，避免读到上一次的返回码
 
         # 坐标校准后再次校验，避免校准期间被其他程序抢走 Windows 前台窗口。
-        if scene == "login" and not self._ensure_login_window_foreground():
+        if not self._ensure_window_foreground(scene):
             return False
 
-        # 登录与业务场景共用同一套已验证的 pyautogui 回放算法；登录仅保留长位移样本和前台校验。
+        # 保持已验证的固定接近动作；登录和业务均使用稳定坐标校准。
         ax, ay = to_screen(mx - 50, my - 40)
         sx, sy = to_screen(mx, my)
         if scene == "login":
@@ -516,21 +747,42 @@ class _RealMouseSolver:
         _human_mouse_to(ax, ay, 0.3)
         _human_mouse_to(sx, sy, 0.2)
         time.sleep(0.15)
-        pyautogui.mouseDown()
-        time.sleep(0.12)
-        for i, (dx, dy, dt) in enumerate(drag):
-            if i == 0:
-                continue
-            tx, ty = to_screen(
-                mx + dx + random.uniform(-1, 1),
-                my + dy + random.uniform(-1, 1),
-            )
-            pyautogui.moveTo(tx, ty)
-            time.sleep(
-                max(0.0, (dt / 1000.0) * random.uniform(0.85, 1.15))
-            )
-        time.sleep(0.08)
-        pyautogui.mouseUp()
+        if scene == "business":
+            # 业务滑块使用已验证的 SendInput + 精密时序：同帧内短间隔点背靠背发送，
+            # 让 Chrome 产生接近真人硬件鼠标的 coalesced 子事件密度。
+            timer_resolution(True)
+            send_button(True)
+            try:
+                time.sleep(random.uniform(0.065, 0.085))
+                started = time.perf_counter()
+                elapsed = 0.0
+                for i, (dx, dy, dt) in enumerate(drag):
+                    if i == 0:
+                        continue
+                    tx, ty = to_screen(mx + dx, my + dy)
+                    send_move_abs(tx, ty)
+                    elapsed += dt / 1000.0
+                    if dt >= 3.0:
+                        precise_sleep(started + elapsed)
+                time.sleep(0.08)
+            finally:
+                send_button(False)
+                timer_resolution(False)
+        else:
+            # 登录滑块保持原有 pyautogui 轨迹、坐标抖动和逐点时序，不受业务优化影响。
+            pyautogui.mouseDown()
+            time.sleep(0.12)
+            for i, (dx, dy, dt) in enumerate(drag):
+                if i == 0:
+                    continue
+                tx, ty = to_screen(
+                    mx + dx + random.uniform(-1, 1),
+                    my + dy + random.uniform(-1, 1),
+                )
+                pyautogui.moveTo(tx, ty)
+                time.sleep(max(0.0, (dt / 1000.0) * random.uniform(0.85, 1.15)))
+            time.sleep(0.08)
+            pyautogui.mouseUp()
         if scene == "login":
             try:
                 observed = frame.evaluate("() => window.__cal || []") or []
@@ -614,6 +866,94 @@ class _RealMouseSolver:
         return x5
 
 
+_shared_solver: Optional[_RealMouseSolver] = None
+_real_mouse_executor: Optional[ThreadPoolExecutor] = None
+_real_mouse_executor_lock = threading.Lock()
+
+
+def _get_real_mouse_executor() -> ThreadPoolExecutor:
+    """返回真人鼠标专用单线程执行器，保证 Playwright Sync 对象始终在同一线程使用。"""
+    global _real_mouse_executor
+    if _real_mouse_executor is None:
+        with _real_mouse_executor_lock:
+            if _real_mouse_executor is None:
+                _real_mouse_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="real-mouse",
+                )
+    return _real_mouse_executor
+
+
+def _get_shared_solver(user_id: str) -> _RealMouseSolver:
+    """获取真人鼠标进程级共享浏览器实例。"""
+    global _shared_solver
+    if _shared_solver is None:
+        _shared_solver = _RealMouseSolver(user_id)
+    else:
+        _shared_solver.update_user(user_id)
+    return _shared_solver
+
+
+def _close_shared_solver_in_worker() -> None:
+    """在真人鼠标专用线程中关闭共享浏览器。"""
+    global _shared_solver
+    if _shared_solver is None:
+        return
+    try:
+        _shared_solver.close()
+    except Exception:
+        pass
+    _shared_solver = None
+
+
+def _shutdown_real_mouse_executor() -> None:
+    """服务退出时在 Playwright 所属线程关闭浏览器，再停止专用执行器。"""
+    global _real_mouse_executor
+    executor = _real_mouse_executor
+    if executor is None:
+        return
+    try:
+        executor.submit(_close_shared_solver_in_worker).result(timeout=15)
+    except Exception:
+        pass
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+    _real_mouse_executor = None
+
+
+try:
+    # ThreadPoolExecutor 会在线程级退出阶段先于普通 atexit 关闭；这里后注册、先执行，
+    # 确保 Playwright 仍可在所属 real-mouse 线程中正常 close，避免 Node 管道 EPIPE。
+    threading._register_atexit(_shutdown_real_mouse_executor)
+except AttributeError:
+    atexit.register(_shutdown_real_mouse_executor)
+
+
+def _execute_shared_verification(
+    user_id: str,
+    url: str,
+    drags: List[List[Tuple[float, float, float]]],
+    browser_timeout: int,
+    url_provider: Optional[Callable[[], Optional[str]]],
+    scene: str,
+) -> Tuple[bool, Optional[Dict[str, str]]]:
+    """在真人鼠标专用线程内完成浏览器准备、滑动和结果收集。"""
+    solver = _get_shared_solver(user_id)
+    budget = max(browser_timeout, 40) + 20
+    watchdog = threading.Timer(budget, solver.force_kill)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        solver.prepare_task(user_id, url)
+        return solver.solve(
+            url, drags, browser_timeout, url_provider, scene=scene
+        )
+    finally:
+        watchdog.cancel()
+
+
 def run_real_mouse_verification(
     user_id: str,
     url: str,
@@ -647,28 +987,19 @@ def run_real_mouse_verification(
         logger.warning(f"【{user_id}】真实鼠标引擎排队获取执行权失败")
         return False, None
     try:
-        solver = _RealMouseSolver(user_id)
-        # 看门狗：总预算内若 solve()/close() 卡死，强杀浏览器解除阻塞，
-        # 保证本函数一定返回（否则上层风控日志会一直停留在“处理中”，且执行权被长期占用）。
-        budget = max(browser_timeout, 40) + 20
-        watchdog = threading.Timer(budget, solver.force_kill)
-        watchdog.daemon = True
-        watchdog.start()
-        ok: bool = False
-        cookies: Optional[Dict[str, str]] = None
         try:
-            ok, cookies = solver.solve(
-                url, drags, browser_timeout, url_provider, scene=scene
+            future = _get_real_mouse_executor().submit(
+                _execute_shared_verification,
+                user_id,
+                url,
+                drags,
+                browser_timeout,
+                url_provider,
+                scene,
             )
+            return future.result()
         except Exception as e:
             logger.error(f"【{user_id}】真实鼠标引擎执行异常: {e}")
-            ok, cookies = False, None
-        finally:
-            try:
-                solver.close()
-            except Exception:
-                pass
-            watchdog.cancel()
-        return ok, cookies
+            return False, None
     finally:
         real_mouse_scheduler.release()
