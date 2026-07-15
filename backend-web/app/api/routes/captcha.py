@@ -12,11 +12,22 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, EmailStr
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
 from app.api import deps
+from app.services.remote_captcha_admission_service import (
+    DEFAULT_REMOTE_COOLDOWN_SECONDS,
+    DEFAULT_REMOTE_PROCESSING_MAX,
+    REMOTE_COOLDOWN_SECONDS_KEY,
+    REMOTE_PROCESSING_MAX_KEY,
+    RemoteCaptchaAdmissionService,
+    sanitize_nonnegative_int,
+)
+from app.services.system_setting_service import SystemSettingService
 from app.services.websocket_client import websocket_client
+from common.models.system_setting import SystemSetting
 from common.models.user import User
 from common.schemas.common import ApiResponse
 
@@ -65,15 +76,19 @@ class RemoteConfigUpdate(BaseModel):
     url: str = ""
     secret_key: str = ""
     pass_cookies: bool = False   # 是否在调用远程接口时传递账号 Cookie（默认关闭）
+    block_remote_calls: bool = True  # 是否禁止外部系统调用本机过滑块接口（默认开启）
     # real_mouse 过滑块本地/远程排队权重（>=0），多来源同时排队时按比例放行，默认 1:1
     local_weight: float = 1
     remote_weight: float = 1
+    remote_processing_max: Optional[int] = None
+    remote_cooldown_seconds: Optional[int] = None
 
 
 # 远程过滑块全局配置存储 key（system_settings，全局唯一，仅管理员可读写）
 REMOTE_CONFIG_URL_KEY = "captcha.remote_service_url"
 REMOTE_CONFIG_SECRET_KEY = "captcha.remote_secret_key"
 REMOTE_CONFIG_PASS_COOKIES_KEY = "captcha.remote_pass_cookies"
+REMOTE_CONFIG_BLOCK_REMOTE_CALLS_KEY = "captcha.block_remote_calls"
 # real_mouse 排队权重（与 common/services/captcha/weighted_scheduler.py 的键保持一致）
 REMOTE_CONFIG_WEIGHT_LOCAL_KEY = "captcha.real_mouse_weight_local"
 REMOTE_CONFIG_WEIGHT_REMOTE_KEY = "captcha.real_mouse_weight_remote"
@@ -86,6 +101,15 @@ def _sanitize_weight(value, default: float = 1.0) -> float:
     except (TypeError, ValueError):
         return default
     return v if v >= 0 else default
+
+
+async def _is_remote_slider_blocked(db: AsyncSession) -> bool:
+    """读取是否禁止外部远程调用本机过滑块接口。"""
+    result = await db.execute(
+        select(SystemSetting.value).where(SystemSetting.key == REMOTE_CONFIG_BLOCK_REMOTE_CALLS_KEY)
+    )
+    value = (result.scalar_one_or_none() or "true").strip().lower()
+    return value == "true"
 
 
 # ==================== 工具函数 ====================
@@ -482,15 +506,24 @@ async def slider_solve(
     - 成功：data = { engine, cookies: { x5sec, ... } }
     - 失败：success=false
     """
-    from sqlalchemy import select
-    from common.models.user import User
+    try:
+        remote_calls_blocked = await _is_remote_slider_blocked(db)
+    except Exception as exc:
+        logger.error(f"检查远程过滑块禁用配置失败: {exc}")
+        return ApiResponse(success=False, message="检查远程过滑块调用配置失败，请稍后重试")
+    if remote_calls_blocked:
+        return ApiResponse(success=False, message="系统已禁止远程过滑块调用")
 
     secret_key = (request.secret_key or "").strip()
     if not secret_key:
         return ApiResponse(success=False, message="缺少秘钥")
 
     # 校验秘钥是否存在（个人设置中的用户秘钥），并查出用户名
-    result = await db.execute(select(User).where(User.secret_key == secret_key))
+    try:
+        result = await db.execute(select(User).where(User.secret_key == secret_key))
+    except Exception as exc:
+        logger.error(f"校验远程过滑块调用秘钥失败: {exc}")
+        return ApiResponse(success=False, message="校验远程过滑块调用秘钥失败，请稍后重试")
     user = result.scalar_one_or_none()
     if not user:
         return ApiResponse(success=False, message="无效的秘钥")
@@ -498,6 +531,14 @@ async def slider_solve(
     url = (request.url or "").strip()
     if not url:
         return ApiResponse(success=False, message="punish 链接不能为空")
+
+    try:
+        admission_allowed, rejection_message = await RemoteCaptchaAdmissionService(db).check_admission()
+    except Exception as exc:
+        logger.error(f"检查远程过滑块调用容量失败: {exc}")
+        return ApiResponse(success=False, message="检查远程过滑块调用容量失败，请稍后重试")
+    if not admission_allowed:
+        return ApiResponse(success=False, message=rejection_message or "远程过滑块调用已拒绝")
 
     timeout = max(20, min(int(request.browser_timeout or 40), 120))
     result_data = await websocket_client.solve_captcha(
@@ -574,6 +615,8 @@ async def test_remote_slider_solve(
                 msg = msg.strip()
                 if "秘钥" in msg and ("无效" in msg or "缺少" in msg):
                     result = ApiResponse(success=False, message=f"连接成功，但秘钥无效（远程：{msg}）")
+                elif "禁止远程" in msg:
+                    result = ApiResponse(success=False, message=f"连接成功，但远程服务已拒绝调用（远程：{msg}）")
                 else:
                     result = ApiResponse(success=True, message=f"连接成功（远程返回：{msg or '正常'}）")
                 logger.info(f"[过滑块测试] 接口返回 {result.model_dump()}")
@@ -590,27 +633,38 @@ async def get_remote_config(
     db: AsyncSession = Depends(deps.get_db_session),
 ) -> ApiResponse:
     """读取远程过滑块全局配置（仅管理员）。"""
-    from sqlalchemy import select
-    from common.models.system_setting import SystemSetting
-
-    rows = (await db.execute(
-        select(SystemSetting).where(
-            SystemSetting.key.in_([
-                REMOTE_CONFIG_URL_KEY,
-                REMOTE_CONFIG_SECRET_KEY,
-                REMOTE_CONFIG_PASS_COOKIES_KEY,
-                REMOTE_CONFIG_WEIGHT_LOCAL_KEY,
-                REMOTE_CONFIG_WEIGHT_REMOTE_KEY,
-            ])
-        )
-    )).scalars().all()
+    try:
+        rows = (await db.execute(
+            select(SystemSetting).where(
+                SystemSetting.key.in_([
+                    REMOTE_CONFIG_URL_KEY,
+                    REMOTE_CONFIG_SECRET_KEY,
+                    REMOTE_CONFIG_PASS_COOKIES_KEY,
+                    REMOTE_CONFIG_BLOCK_REMOTE_CALLS_KEY,
+                    REMOTE_CONFIG_WEIGHT_LOCAL_KEY,
+                    REMOTE_CONFIG_WEIGHT_REMOTE_KEY,
+                    REMOTE_PROCESSING_MAX_KEY,
+                    REMOTE_COOLDOWN_SECONDS_KEY,
+                ])
+            )
+        )).scalars().all()
+    except Exception as exc:
+        logger.error(f"读取远程过滑块配置失败: {exc}")
+        return ApiResponse(success=False, message="读取远程过滑块配置失败，请稍后重试")
     m = {r.key: (r.value or "") for r in rows}
     return ApiResponse(success=True, data={
         "url": m.get(REMOTE_CONFIG_URL_KEY, ""),
         "secret_key": m.get(REMOTE_CONFIG_SECRET_KEY, ""),
         "pass_cookies": (m.get(REMOTE_CONFIG_PASS_COOKIES_KEY, "") or "").strip().lower() == "true",
+        "block_remote_calls": (m.get(REMOTE_CONFIG_BLOCK_REMOTE_CALLS_KEY, "true") or "true").strip().lower() == "true",
         "local_weight": _sanitize_weight(m.get(REMOTE_CONFIG_WEIGHT_LOCAL_KEY), 1.0),
         "remote_weight": _sanitize_weight(m.get(REMOTE_CONFIG_WEIGHT_REMOTE_KEY), 1.0),
+        "remote_processing_max": sanitize_nonnegative_int(
+            m.get(REMOTE_PROCESSING_MAX_KEY), DEFAULT_REMOTE_PROCESSING_MAX
+        ),
+        "remote_cooldown_seconds": sanitize_nonnegative_int(
+            m.get(REMOTE_COOLDOWN_SECONDS_KEY), DEFAULT_REMOTE_COOLDOWN_SECONDS
+        ),
     })
 
 
@@ -621,25 +675,48 @@ async def update_remote_config(
     db: AsyncSession = Depends(deps.get_db_session),
 ) -> ApiResponse:
     """保存远程过滑块全局配置（仅管理员，存于 system_settings，全局唯一）。"""
-    from app.services.system_setting_service import SystemSettingService
+    if request.remote_processing_max is not None and request.remote_processing_max < 0:
+        return ApiResponse(success=False, message="远程处理中最大条数不能小于 0")
+    if request.remote_cooldown_seconds is not None and request.remote_cooldown_seconds < 0:
+        return ApiResponse(success=False, message="远程调用冷却时间不能小于 0")
+
+    settings_to_save: dict[str, tuple[str, str | None]] = {
+        REMOTE_CONFIG_URL_KEY: ((request.url or "").strip(), "远程过滑块服务URL"),
+        REMOTE_CONFIG_SECRET_KEY: ((request.secret_key or "").strip(), "远程过滑块秘钥"),
+        REMOTE_CONFIG_PASS_COOKIES_KEY: (
+            "true" if request.pass_cookies else "false",
+            "远程过滑块是否传递账号Cookie",
+        ),
+        REMOTE_CONFIG_BLOCK_REMOTE_CALLS_KEY: (
+            "true" if request.block_remote_calls else "false",
+            "是否禁止外部远程调用backend-web过滑块接口",
+        ),
+        # real_mouse 排队权重：规整为非负数后落库，供 websocket 侧调度器读取。
+        REMOTE_CONFIG_WEIGHT_LOCAL_KEY: (
+            str(_sanitize_weight(request.local_weight, 1.0)),
+            "real_mouse过滑块本地排队权重",
+        ),
+        REMOTE_CONFIG_WEIGHT_REMOTE_KEY: (
+            str(_sanitize_weight(request.remote_weight, 1.0)),
+            "real_mouse过滑块远程排队权重",
+        ),
+    }
+    if request.remote_processing_max is not None:
+        settings_to_save[REMOTE_PROCESSING_MAX_KEY] = (
+            str(request.remote_processing_max),
+            "远程调用允许的最大处理中滑块日志数，0=不限制",
+        )
+    if request.remote_cooldown_seconds is not None:
+        settings_to_save[REMOTE_COOLDOWN_SECONDS_KEY] = (
+            str(request.remote_cooldown_seconds),
+            "远程调用达到处理中上限后的冷却秒数，0=不冷却",
+        )
 
     svc = SystemSettingService(db)
-    await svc.set_setting(REMOTE_CONFIG_URL_KEY, (request.url or "").strip(), "远程过滑块服务URL")
-    await svc.set_setting(REMOTE_CONFIG_SECRET_KEY, (request.secret_key or "").strip(), "远程过滑块秘钥")
-    await svc.set_setting(
-        REMOTE_CONFIG_PASS_COOKIES_KEY,
-        "true" if request.pass_cookies else "false",
-        "远程过滑块是否传递账号Cookie",
-    )
-    # real_mouse 排队权重：规整为非负数后落库（字符串存储），供 websocket 侧调度器读取
-    await svc.set_setting(
-        REMOTE_CONFIG_WEIGHT_LOCAL_KEY,
-        str(_sanitize_weight(request.local_weight, 1.0)),
-        "real_mouse过滑块本地排队权重",
-    )
-    await svc.set_setting(
-        REMOTE_CONFIG_WEIGHT_REMOTE_KEY,
-        str(_sanitize_weight(request.remote_weight, 1.0)),
-        "real_mouse过滑块远程排队权重",
-    )
+    try:
+        await svc.set_settings(settings_to_save)
+    except Exception as exc:
+        await db.rollback()
+        logger.error(f"保存远程过滑块配置失败: {exc}")
+        return ApiResponse(success=False, message="保存远程过滑块配置失败，请稍后重试")
     return ApiResponse(success=True, message="保存成功")
