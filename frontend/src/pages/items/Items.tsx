@@ -1,6 +1,6 @@
 ﻿import { useEffect, useState, useRef } from 'react'
 import { CheckSquare, Download, Edit2, ExternalLink, Loader2, Package, PackageX, RefreshCw, Search, Square, Trash2, X, Settings, Plus, MessageSquare, Bot, ChevronLeft, ChevronRight, ImagePlus, Unlink } from 'lucide-react'
-import { batchDeleteItems, batchOfflineItems, deleteItem, fetchAllItemsFromAccessibleAccounts, fetchAllItemsFromAccount, getItemsPaginated, updateItem, updateItemMultiQuantityDelivery, updateItemMultiSpec, getItemDefaultReply, saveItemDefaultReply, deleteItemDefaultReply, batchSaveItemDefaultReply, batchDeleteItemDefaultReply, getItemAiPrompt, saveItemAiPrompt, batchDeleteItemAiPrompt, batchSaveItemAiPrompt, uploadItemDefaultReplyImage, uploadBatchDefaultReplyImage, type ItemFilterParams } from '@/api/items'
+import { batchDeleteItems, batchOfflineItems, batchUpdateItemAiEnabled, deleteItem, fetchAllItemsFromAccessibleAccounts, fetchAllItemsFromAccount, getItemsPaginated, updateItem, updateItemMultiQuantityDelivery, updateItemMultiSpec, updateItemAiEnabled, getItemDefaultReply, saveItemDefaultReply, deleteItemDefaultReply, batchSaveItemDefaultReply, batchDeleteItemDefaultReply, getItemAiPrompt, saveItemAiPrompt, batchDeleteItemAiPrompt, batchSaveItemAiPrompt, uploadItemDefaultReplyImage, uploadBatchDefaultReplyImage, type ItemFilterParams } from '@/api/items'
 import { getAccountDetails } from '@/api/accounts'
 import { batchClearItemRelations } from '@/api/cards'
 import { ItemCardRelationModal } from './ItemCardRelationModal'
@@ -107,6 +107,7 @@ export function Items() {
   const [batchDeleteAiPromptConfirm, setBatchDeleteAiPromptConfirm] = useState(false)
   const [batchClearCardRelationsConfirm, setBatchClearCardRelationsConfirm] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [batchUpdatingAiEnabled, setBatchUpdatingAiEnabled] = useState(false)
   // const hasSearchEffectInitializedRef = useRef(false)  // 已改为手动查询，不再需要
   const skipNextSearchEffectRef = useRef(false)
 
@@ -315,6 +316,8 @@ export function Items() {
     }
   }
 
+  const getSelectedItems = () => items.filter((item) => selectedIds.has(item.id))
+
   const handleBatchDelete = async () => {
     if (selectedIds.size === 0) {
       addToast({ type: 'warning', message: '请先选择要删除的商品' })
@@ -413,6 +416,45 @@ export function Items() {
       loadItems()
     } catch {
       addToast({ type: 'error', message: '操作失败' })
+    }
+  }
+
+  // 切换AI回复开关
+  const handleToggleAiEnabled = async (item: Item) => {
+    try {
+      const newStatus = !(item.ai_reply_enabled ?? true)
+      await updateItemAiEnabled(item.cookie_id, item.item_id, newStatus)
+      addToast({ type: 'success', message: `AI回复已${newStatus ? '开启' : '关闭'}` })
+      loadItems()
+    } catch {
+      addToast({ type: 'error', message: '操作失败' })
+    }
+  }
+
+  const handleBatchToggleAiEnabled = async (enabled: boolean) => {
+    const selectedItems = getSelectedItems()
+    if (selectedItems.length === 0) {
+      addToast({ type: 'warning', message: '请先选择要操作的商品' })
+      return
+    }
+
+    setBatchUpdatingAiEnabled(true)
+    try {
+      const result = await batchUpdateItemAiEnabled(
+        selectedItems.map((item) => ({ cookie_id: item.cookie_id, item_id: item.item_id })),
+        enabled
+      )
+      if (result.success) {
+        addToast({ type: 'success', message: result.message || `已${enabled ? '开启' : '关闭'}选中商品的AI回复` })
+        setSelectedIds(new Set())
+        loadItems()
+      } else {
+        addToast({ type: 'error', message: result.message || '批量操作失败' })
+      }
+    } catch {
+      addToast({ type: 'error', message: '批量操作失败' })
+    } finally {
+      setBatchUpdatingAiEnabled(false)
     }
   }
 
@@ -1028,6 +1070,22 @@ export function Items() {
         <div className="flex flex-wrap gap-2">
           {selectedIds.size > 0 && (
             <>
+              <button
+                onClick={() => handleBatchToggleAiEnabled(true)}
+                className="btn-ios-secondary"
+                disabled={batchUpdatingAiEnabled}
+              >
+                {batchUpdatingAiEnabled ? <Loader2 className="w-4 h-4 animate-spin" /> : <Bot className="w-4 h-4" />}
+                开启AI回复
+              </button>
+              <button
+                onClick={() => handleBatchToggleAiEnabled(false)}
+                className="btn-ios-secondary"
+                disabled={batchUpdatingAiEnabled}
+              >
+                {batchUpdatingAiEnabled ? <Loader2 className="w-4 h-4 animate-spin" /> : <Bot className="w-4 h-4" />}
+                关闭AI回复
+              </button>
               <button onClick={() => setBatchDeleteItemConfirm(true)} className="btn-ios-danger">
                 <Trash2 className="w-4 h-4" />
                 删除选中 ({selectedIds.size})
@@ -1239,6 +1297,7 @@ export function Items() {
                   <th className="min-w-[120px] text-center">多数量发货</th>
                   <th className="min-w-[110px] text-center">关联卡券</th>
                   <th className="min-w-[110px] text-center">默认回复</th>
+                  <th className="min-w-[100px] text-center">AI开关</th>
                   <th className="min-w-[110px] text-center">AI提示词</th>
                   <th className="min-w-[170px]">创建时间</th>
                   <th className="min-w-[170px]">更新时间</th>
@@ -1248,7 +1307,7 @@ export function Items() {
             <tbody>
               {filteredItems.length === 0 ? (
                 <tr>
-                  <td colSpan={14}>
+                  <td colSpan={15}>
                     <div className="empty-state py-8">
                       <Package className="empty-state-icon" />
                       <p className="text-gray-500">暂无商品数据</p>
@@ -1371,6 +1430,19 @@ export function Items() {
                       >
                         <MessageSquare className="w-3 h-3" />
                         {item.has_default_reply ? (item.default_reply_enabled ? '已配置' : '已关闭') : '未配置'}
+                      </button>
+                    </td>
+                    <td>
+                      <button
+                        onClick={() => handleToggleAiEnabled(item)}
+                        className={`px-2 py-1 rounded text-xs font-medium transition-colors ${
+                          (item.ai_reply_enabled ?? true)
+                            ? 'bg-green-100 text-green-700 hover:bg-green-200 dark:bg-green-900/30 dark:text-green-400'
+                            : 'bg-gray-100 text-gray-500 hover:bg-gray-200 dark:bg-slate-800 dark:text-gray-400'
+                        }`}
+                        title={(item.ai_reply_enabled ?? true) ? '点击关闭AI回复' : '点击开启AI回复'}
+                      >
+                        {(item.ai_reply_enabled ?? true) ? '已开启' : '已关闭'}
                       </button>
                     </td>
                     <td>

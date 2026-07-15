@@ -575,6 +575,104 @@ async def save_item_ai_prompt(
         return ApiResponse(success=False, message=f"保存失败: {str(e)}")
 
 
+class ItemAiEnabledRequest(PydanticBaseModel):
+    """商品AI回复开关请求"""
+    ai_reply_enabled: bool
+
+
+class BatchItemAiEnabledEntry(PydanticBaseModel):
+    """批量商品AI回复开关条目"""
+    cookie_id: str
+    item_id: str
+
+
+class BatchItemAiEnabledRequest(PydanticBaseModel):
+    """批量商品AI回复开关请求"""
+    items: List[BatchItemAiEnabledEntry]
+    ai_reply_enabled: bool
+
+
+@items_router.put("/{cookie_id}/{item_id}/ai-enabled", response_model=ApiResponse)
+async def update_item_ai_enabled(
+    cookie_id: str,
+    item_id: str,
+    payload: ItemAiEnabledRequest,
+    current_user: User = Depends(deps.get_current_active_user),
+    account_service: AccountService = Depends(deps.get_account_service),
+    item_service: ItemService = Depends(deps.get_item_service),
+) -> ApiResponse:
+    """更新商品AI回复开关"""
+    # 管理员可以操作所有账号，普通用户只能操作自己的账号
+    owner_id, _ = resolve_owner_scope(current_user)
+
+    account = await account_service.get_account_for_user(owner_id, cookie_id)
+    if not account:
+        return ApiResponse(success=False, message="账号不存在")
+
+    try:
+        updated = await item_service.update_item(account, item_id, {"ai_reply_enabled": payload.ai_reply_enabled})
+        if updated:
+            status_text = "开启" if payload.ai_reply_enabled else "关闭"
+            return ApiResponse(success=True, message=f"商品AI回复已{status_text}")
+        else:
+            return ApiResponse(success=False, message="商品不存在")
+    except Exception as e:
+        logger.error(f"更新商品AI回复开关失败: {e}")
+        return ApiResponse(success=False, message=f"更新失败: {str(e)}")
+
+
+@items_router.put("/batch-ai-enabled", response_model=ApiResponse)
+async def batch_update_item_ai_enabled(
+    payload: BatchItemAiEnabledRequest,
+    current_user: User = Depends(deps.get_current_active_user),
+    account_service: AccountService = Depends(deps.get_account_service),
+    item_service: ItemService = Depends(deps.get_item_service),
+) -> ApiResponse:
+    """批量更新商品AI回复开关"""
+    owner_id, _ = resolve_owner_scope(current_user)
+
+    if not payload.items:
+        return ApiResponse(success=False, message="请选择至少一个商品")
+
+    accounts = await account_service.list_accounts(owner_id)
+    account_map = {account.account_id: account for account in accounts}
+    valid_pairs: list[tuple[int, str]] = []
+    invalid_count = 0
+    for entry in payload.items:
+        account = account_map.get(entry.cookie_id)
+        if not account:
+            invalid_count += 1
+            continue
+        valid_pairs.append((account.id, entry.item_id))
+
+    status_text = "开启" if payload.ai_reply_enabled else "关闭"
+    try:
+        result = await item_service.batch_update_ai_enabled(
+            owner_id=owner_id,
+            account_item_pairs=valid_pairs,
+            enabled=payload.ai_reply_enabled,
+        )
+    except Exception as exc:
+        logger.error(f"批量更新商品AI回复开关失败: {exc}")
+        return ApiResponse(success=False, message=f"批量{status_text}AI回复失败: {exc}")
+
+    updated_count = result["updated"]
+    skipped_count = result["skipped"]
+    missing_count = result["missing"] + invalid_count
+
+    message_parts = []
+    if updated_count > 0:
+        message_parts.append(f"已{status_text} {updated_count} 个商品的AI回复")
+    if skipped_count > 0:
+        message_parts.append(f"{skipped_count} 个商品原本已{status_text}")
+    if missing_count > 0:
+        message_parts.append(f"{missing_count} 个商品未找到或无权限")
+
+    if updated_count > 0 or skipped_count > 0:
+        return ApiResponse(success=True, message="，".join(message_parts))
+    return ApiResponse(success=False, message="，".join(message_parts) or f"批量{status_text}AI回复失败")
+
+
 class BatchDeleteAiPromptRequest(PydanticBaseModel):
     """批量删除商品AI提示词请求"""
     item_ids: List[str]

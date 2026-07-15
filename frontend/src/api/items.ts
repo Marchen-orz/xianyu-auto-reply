@@ -151,6 +151,19 @@ export const updateItemMultiSpec = (cookieId: string, itemId: string, enabled: b
   return put(`${ITEM_PREFIX}/${cookieId}/${itemId}/multi-spec`, { is_multi_spec: enabled })
 }
 
+// 更新商品AI回复开关
+export const updateItemAiEnabled = (cookieId: string, itemId: string, enabled: boolean): Promise<ApiResponse> => {
+  return put(`${ITEM_PREFIX}/${cookieId}/${itemId}/ai-enabled`, { ai_reply_enabled: enabled })
+}
+
+// 批量更新商品AI回复开关
+export const batchUpdateItemAiEnabled = (
+  items: { cookie_id: string; item_id: string }[],
+  enabled: boolean
+): Promise<ApiResponse> => {
+  return put(`${ITEM_PREFIX}/batch-ai-enabled`, { items, ai_reply_enabled: enabled })
+}
+
 
 // ==================== 商品默认回复 ====================
 

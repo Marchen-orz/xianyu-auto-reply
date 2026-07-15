@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Index, JSON, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Index, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from common.db.base_class import Base
@@ -41,6 +41,7 @@ class XYCatalogItem(Base):
     price: Mapped[str | None] = mapped_column(String(32), comment="商品价格")
     ai_prompt: Mapped[str | None] = mapped_column(Text, comment="商品AI提示词")
     is_polished: Mapped[bool | None] = mapped_column("is_polished", default=False, comment="是否擦亮")
+    ai_reply_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, comment="AI回复开关")
     metadata_json: Mapped[dict | None] = mapped_column("metadata", JSON, comment="商品元数据")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), comment="创建时间")
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), onupdate=datetime.now, comment="更新时间")

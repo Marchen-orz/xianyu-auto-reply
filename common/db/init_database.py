@@ -456,6 +456,7 @@ class DatabaseInitializer:
                 price VARCHAR(32) COMMENT '商品价格',
                 ai_prompt TEXT COMMENT '商品AI提示词',
                 is_polished TINYINT(1) DEFAULT 0 COMMENT '是否擦亮',
+                ai_reply_enabled TINYINT(1) NOT NULL DEFAULT 1 COMMENT 'AI回复开关',
                 metadata JSON COMMENT '商品元数据',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
@@ -1841,6 +1842,7 @@ class DatabaseInitializer:
         "xy_catalog_items": [
             ("ai_prompt", "TEXT COMMENT '商品AI提示词'", "price"),
             ("is_polished", "TINYINT(1) DEFAULT 0 COMMENT '是否擦亮'", "ai_prompt"),
+            ("ai_reply_enabled", "TINYINT(1) NOT NULL DEFAULT 1 COMMENT 'AI回复开关'", "is_polished"),
             ("updated_at", "DATETIME COMMENT '更新时间'", "created_at"),
         ],
         "xy_announcements": [

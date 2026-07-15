@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Set
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -741,7 +741,7 @@ class ItemService:
         metadata_modified = False
         for key, value in data.items():
             # 检查是否是直接字段（title, price, ai_prompt等）
-            if key in ['title', 'price', 'ai_prompt'] and hasattr(item, key):
+            if key in ['title', 'price', 'ai_prompt', 'ai_reply_enabled'] and hasattr(item, key):
                 logger.info(f"更新字段 {key}: {getattr(item, key)} -> {value}")
                 setattr(item, key, value)
             # 检查是否需要映射到metadata
@@ -766,6 +766,54 @@ class ItemService:
         await self.session.commit()
         logger.info(f"商品更新已提交: item_id={item_id}")
         return True
+
+    async def batch_update_ai_enabled(
+        self,
+        owner_id: int | None,
+        account_item_pairs: list[tuple[int, str]],
+        enabled: bool,
+    ) -> dict[str, int]:
+        """批量更新商品 AI 回复开关。
+
+        行为：
+        1. 一次性查询所有目标商品；
+        2. 已经是目标状态的商品直接跳过；
+        3. 仅对实际需要变更的商品更新，并统一提交一次事务。
+        """
+        if not account_item_pairs:
+            return {"requested": 0, "matched": 0, "updated": 0, "skipped": 0, "missing": 0}
+
+        unique_pairs = list(dict.fromkeys(account_item_pairs))
+        stmt = select(XYCatalogItem).where(
+            tuple_(XYCatalogItem.account_pk, XYCatalogItem.item_id).in_(unique_pairs)
+        )
+        if owner_id is not None:
+            stmt = stmt.where(XYCatalogItem.owner_id == owner_id)
+
+        rows = (await self.session.execute(stmt)).scalars().all()
+
+        updated = 0
+        skipped = 0
+        for item in rows:
+            current_enabled = item.ai_reply_enabled is not False
+            if current_enabled == enabled:
+                skipped += 1
+                continue
+            item.ai_reply_enabled = enabled
+            updated += 1
+
+        if updated > 0:
+            await self.session.commit()
+
+        matched = len(rows)
+        missing = len(unique_pairs) - matched
+        return {
+            "requested": len(unique_pairs),
+            "matched": matched,
+            "updated": updated,
+            "skipped": skipped,
+            "missing": missing,
+        }
 
     async def delete_item(self, account: XYAccount, item_id: str) -> bool:
         """删除商品（同时删除关联表记录）"""
@@ -873,6 +921,7 @@ class ItemService:
             "item_price": item.price,
             "ai_prompt": item.ai_prompt or "",
             "has_ai_prompt": bool(item.ai_prompt),
+            "ai_reply_enabled": item.ai_reply_enabled is not False,  # 默认开启：仅显式 False 才视为关闭
             "is_polished": item.is_polished or False,
             "is_multi_spec": metadata.get("is_multi_spec", False),
             "multi_quantity_delivery": metadata.get("multi_quantity_delivery", False),

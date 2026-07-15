@@ -1826,6 +1826,12 @@ class AutoReplyService:
                 item = result.scalars().first()
                 
                 if item:
+                    # 商品级AI回复开关：默认开启，显式关闭后该商品不再AI回复（落入默认回复）
+                    if item.ai_reply_enabled is False:
+                        logger.info(f"【{self.cookie_id}】商品 {item_id} AI回复已关闭，跳过AI回复")
+                        if reply_trace is not None:
+                            reply_trace.setdefault("context_snapshot", {})["ai_blocked_reason"] = "item_ai_disabled"
+                        return None
                     price_str = item.price or "0"
                     try:
                         price_clean = ''.join(c for c in price_str if c.isdigit() or c == '.')
