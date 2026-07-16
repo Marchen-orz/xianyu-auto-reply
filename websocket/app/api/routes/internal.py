@@ -418,11 +418,49 @@ async def solve_captcha(request: SolveCaptchaRequest):
             url_provider = _remote_url_provider
             logger.info(f"【过滑块接口】account_id={safe_id} 已携带 Cookie，启用链接过期自动重取")
 
-        # 被调用接口不信任请求体中的 call_type，所有请求固定进入远程桶，避免伪装成本地权重。
-        # 远程内部保留既有子优先级：无 Cookie 优先于有 Cookie。
-        weight_class = "remote_cookie" if existing_cookies_str else "remote"
-        slider_args = (
+        # 读取全局"远程过滑块"配置（与 cookie_token_manager 一致）
+        # 配置了则优先走远程接口；远程超时/不可用时回退本机逻辑。
+        remote_config = None
+        try:
+            from common.db.session import async_session_maker
+            from common.models.system_setting import SystemSetting
+            from sqlalchemy import select
+
+            async with async_session_maker() as session:
+                rows = (await session.execute(
+                    select(SystemSetting).where(
+                        SystemSetting.key.in_(
+                            [
+                                "captcha.remote_service_url",
+                                "captcha.remote_secret_key",
+                                "captcha.remote_pass_cookies",
+                            ]
+                        )
+                    )
+                )).scalars().all()
+            _m = {r.key: (r.value or "") for r in rows}
+            _rurl = (_m.get("captcha.remote_service_url") or "").strip()
+            _rsecret = (_m.get("captcha.remote_secret_key") or "").strip()
+            _rpass = (_m.get("captcha.remote_pass_cookies") or "").strip().lower() == "true"
+            if _rurl and _rsecret:
+                remote_config = {
+                    "url": _rurl,
+                    "secret": _rsecret,
+                    "pass_cookies": _rpass,
+                    "device_id": device_id if _rpass else "",
+                }
+                logger.info(f"【过滑块接口】account_id={safe_id} 已配置远程过滑块，优先走远程")
+        except Exception as _rc_e:
+            logger.warning(f"【过滑块接口】account_id={safe_id} 读取远程过滑块配置失败（走本机逻辑）: {_rc_e}")
+
+        # 远程过滑块接口：real_mouse 排队时按远程权重放行。
+        # 远程内部再分两级严格优先——没传 Cookie 的（"remote"）优先于传了 Cookie 的（"remote_cookie"）。
+        remote_weight_class = "remote_cookie" if existing_cookies_str else "remote"
+        success, cookies, engine = await run_browser_task(
+            run_slider_verification_with_fallback,
             safe_id, url, True, False, timeout, existing_cookies_str, url_provider,
+            remote_config=remote_config,
+            weight_class=remote_weight_class,
         )
         if is_real_mouse_enabled():
             # 被调用方请求在线程池之前参与本地/远程实时加权排队。

@@ -49,6 +49,23 @@ CAPTCHA_NOT_REQUIRED = "__CAPTCHA_NOT_REQUIRED__"
 # 以 engine='url_expired' 上报，最终让远程调用方据此刷新 URL 后重试。
 URL_EXPIRED = "__URL_EXPIRED__"
 
+# 与真实鼠标模式保持一致的最小注入：仅隐藏 webdriver 并记录坐标校准事件。
+_STEALTH_MINIMAL = """
+try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true }); } catch (e) {}
+try { delete Object.getPrototypeOf(navigator).webdriver; } catch (e) {}
+try { delete window.__playwright; delete window.__pw_manual; delete window.__PW_inspect; } catch (e) {}
+"""
+
+_CAP_JS = r"""
+(() => {
+  if (window.__cal) return;
+  window.__cal = [];
+  document.addEventListener('mousemove', e => {
+    window.__cal.push([e.clientX, e.clientY, e.screenX, e.screenY, e.timeStamp, e.buttons]);
+  }, true);
+})();
+"""
+
 
 class PlaywrightSliderService:
     """Playwright滑块验证服务"""
@@ -344,10 +361,11 @@ class PlaywrightSliderService:
                 raise Exception("页面创建失败")
             logger.info(f"【{self.pure_user_id}】页面创建成功（{'最大化窗口模式' if not self.headless else '无头模式'}）")
 
-            # 添加增强反检测脚本（密码登录时不需要，参照旧框架）
+            # 添加最小反检测脚本（与真实鼠标模式保持一致）
             if add_stealth_script:
-                logger.info(f"【{self.pure_user_id}】添加反检测脚本...")
-                self.page.add_init_script(get_stealth_script(browser_features))
+                logger.info(f"【{self.pure_user_id}】添加最小反检测脚本...")
+                self.page.add_init_script(_STEALTH_MINIMAL)
+                self.page.add_init_script(_CAP_JS)
             logger.info(f"【{self.pure_user_id}】浏览器初始化完成")
 
             # 初始化元素查找器和验证检查器

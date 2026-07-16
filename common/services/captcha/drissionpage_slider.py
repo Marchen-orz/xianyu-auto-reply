@@ -71,10 +71,21 @@ class DrissionPageSliderService:
         self.cookies: Dict[str, str] = {}
         self.refresh_next = False
 
-        # Docker 环境强制无头
-        if not headless and os.environ.get("BROWSER_HEADLESS", "").lower() == "true":
+        # Docker 环境强制无头；但允许 DrissionPage 专用配置显式关闭无头以便本地调试
+        browser_headless = os.environ.get("BROWSER_HEADLESS", "").lower() == "true"
+        drissionpage_headless_override = os.environ.get("CAPTCHA_DRISSIONPAGE_HEADLESS", "").lower()
+        if (
+            not headless
+            and browser_headless
+            and drissionpage_headless_override != "false"
+        ):
             logger.info(f"【{user_id}】检测到 BROWSER_HEADLESS=true，强制无头模式")
             headless = True
+        elif not headless and browser_headless:
+            logger.info(
+                f"【{user_id}】检测到 CAPTCHA_DRISSIONPAGE_HEADLESS=false，"
+                "DrissionPage 使用有头模式"
+            )
         self.headless = headless
 
         self.pure_user_id = concurrency_manager._extract_pure_user_id(user_id)
@@ -173,6 +184,34 @@ class DrissionPageSliderService:
         self.page = self.browser.latest_tab
         logger.info(f"【{self.pure_user_id}】DrissionPage 浏览器启动成功")
 
+    def _log_page_diagnostics(self, stage: str) -> None:
+        """输出页面诊断信息，便于判断未找到滑块的真实原因。"""
+        try:
+            current_url = getattr(self.page, "url", "")
+        except Exception:
+            current_url = ""
+        try:
+            current_title = getattr(self.page, "title", "")
+        except Exception:
+            current_title = ""
+        try:
+            html = self.page.html or ""
+        except Exception as e:
+            logger.warning(f"【{self.pure_user_id}】{stage} 获取页面HTML失败: {e}")
+            html = ""
+
+        keywords = ["验证码", "captcha", "滑块", "nc_1_n1z", "nc-container", "punish", "x5sec"]
+        hits = [kw for kw in keywords if kw in html or kw in current_url or kw in current_title]
+        html_preview = " ".join(html.split())[:300] if html else ""
+        logger.info(
+            f"【{self.pure_user_id}】{stage} 页面诊断: "
+            f"url={current_url or '<空>'}, title={current_title or '<空>'}, "
+            f"keywords={hits or ['<无>']}"
+        )
+        if html_preview:
+            logger.info(f"【{self.pure_user_id}】{stage} 页面片段: {html_preview}")
+
+
     def _clean_singleton_lock_files(self) -> None:
         """清理 user_data_dir 中残留的 Chrome Singleton 锁文件。
 
@@ -258,6 +297,48 @@ class DrissionPageSliderService:
         """动态计算滑动距离（委托 drissionpage_motion）。"""
         return calculate_slide_distance(self.page, self.pure_user_id)
 
+    def _click_slider_refresh(self) -> bool:
+        """点击失败态的重试按钮，让滑块重新初始化。"""
+        refresh_selectors = [
+            "#nc_1_refresh1",
+            ".nc_iconfont.btn_refresh",
+            ".errloading",
+            "[class*='refresh']",
+            ".nc-container",
+        ]
+        for selector in refresh_selectors:
+            try:
+                element = self.page.ele(selector)
+                if not element:
+                    continue
+                element.click()
+                logger.info(f"【{self.pure_user_id}】已点击 DrissionPage 滑块重试按钮: {selector}")
+                return True
+            except Exception:
+                continue
+        logger.warning(f"【{self.pure_user_id}】未找到 DrissionPage 滑块重试按钮")
+        return False
+
+    def _prepare_next_attempt(self, url: str, attempt: int) -> None:
+        """在下一次滑动前主动重置失败态页面。"""
+        if attempt == 0:
+            logger.info(f"【{self.pure_user_id}】DrissionPage 打开验证页面")
+            self.page.get(url)
+            time.sleep(random.uniform(1, 3))
+            self._log_page_diagnostics("首次打开后")
+            return
+
+        if self._click_slider_refresh():
+            time.sleep(random.uniform(1.5, 2.5))
+            self._log_page_diagnostics("点击重试后")
+            return
+
+        logger.info(f"【{self.pure_user_id}】DrissionPage 刷新页面重试")
+        self.page.get(url)
+        time.sleep(random.uniform(2, 4))
+        self.refresh_next = False
+        self._log_page_diagnostics("重开页面后")
+
     def _slide(self) -> None:
         """执行一次拟人化滑动（三段循环策略：谨慎/急躁/反思）。"""
         self.slide_attempt += 1
@@ -288,9 +369,14 @@ class DrissionPageSliderService:
         ele = self.page.wait.eles_loaded(self.SLIDER_LOADED_SELECTOR, timeout=10)
         if not ele:
             logger.warning(f"【{self.pure_user_id}】未找到滑块元素")
+            self._log_page_diagnostics("未找到滑块")
             return
 
         slider = self.page.ele(self.SLIDER_SELECTOR)
+        if not slider:
+            logger.warning(f"【{self.pure_user_id}】滑块加载完成但未定位到可操作元素")
+            self._log_page_diagnostics("滑块选择器未命中")
+            return
         time.sleep(random.uniform(0.1, 0.5) if is_impatient else random.uniform(0.8, 2.0))
 
         try:
@@ -333,18 +419,7 @@ class DrissionPageSliderService:
                     break
 
                 try:
-                    if attempt == 0:
-                        logger.info(f"【{self.pure_user_id}】DrissionPage 打开验证页面")
-                        self.page.get(url)
-                        time.sleep(random.uniform(1, 3))
-                    elif self.refresh_next:
-                        logger.info(f"【{self.pure_user_id}】DrissionPage 刷新页面重试")
-                        self.page.refresh()
-                        time.sleep(random.uniform(2, 4))
-                        self.refresh_next = False
-                    else:
-                        logger.info(f"【{self.pure_user_id}】DrissionPage 不刷新，直接重试")
-                        time.sleep(random.uniform(1, 2))
+                    self._prepare_next_attempt(url, attempt)
 
                     self._slide()
 
@@ -366,8 +441,10 @@ class DrissionPageSliderService:
                         logger.warning(
                             f"【{self.pure_user_id}】第 {attempt + 1} 次滑动未通过（标题: {self.page.title}）"
                         )
+                        self.refresh_next = True
                 except Exception as e:
                     logger.error(f"【{self.pure_user_id}】DrissionPage 第 {attempt + 1} 次异常: {e}")
+                    self._log_page_diagnostics(f"第 {attempt + 1} 次异常后")
 
             logger.error(f"【{self.pure_user_id}】DrissionPage 兜底最终失败")
             return False, None
