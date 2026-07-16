@@ -88,6 +88,8 @@ export function ChatNew() {
   const [sending, setSending] = useState(false)
   // 发送图片：隐藏的文件选择框引用
   const imageInputRef = useRef<HTMLInputElement>(null)
+  // 聊天输入框引用：发送后自动重新聚焦
+  const chatInputRef = useRef<HTMLTextAreaElement>(null)
   const [pendingImage, setPendingImage] = useState<{ file: File; previewUrl: string } | null>(null)
   const pendingImageRef = useRef<{ file: File; previewUrl: string } | null>(null)
 
@@ -875,6 +877,8 @@ export function ChatNew() {
       addToast({ message: failReason, type: 'error' })
     } finally {
       setSending(false)
+      // 发送完成后自动重新聚焦输入框，方便连续发送
+      requestAnimationFrame(() => chatInputRef.current?.focus())
     }
   }
 
@@ -1455,6 +1459,7 @@ export function ChatNew() {
                 <ImagePlus className="w-4 h-4" />
               </button>
               <textarea
+                ref={chatInputRef}
                 value={inputText}
                 onChange={(e) => setInputText(e.target.value)}
                 onPaste={handlePasteImage}
