@@ -298,6 +298,9 @@ def run_slider_verification_with_fallback(
             )
 
     # 1. Playwright 主引擎
+    #    真人轨迹回放模式需要更长的超时（浏览器启动+导航+多次重试换轨迹）
+    if _is_human_trail_enabled():
+        browser_timeout = max(browser_timeout, 60)
     ok, cookies = run_slider_verification(
         user_id, url, enable_learning, headless, browser_timeout,
         url_provider=url_provider,
