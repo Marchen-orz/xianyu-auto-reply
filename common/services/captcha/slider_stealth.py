@@ -162,8 +162,6 @@ def _load_human_trail_drags() -> List[List[Tuple[float, float, float]]]:
         if distance < 120 or distance > 1200:
             continue
         drags.append(rel)
-        if f == preferred_path and rel:
-            return [rel]
     return drags
 
 
@@ -178,16 +176,21 @@ def _scale_trail_to_distance(
     return scaled
 
 
+# 上次选中的轨迹索引，用于避免连续选同一条
+_last_trail_index = -1
+
+
 def _choose_trail_drag(drags: List[List[Tuple[float, float, float]]]) -> List[Tuple[float, float, float]]:
-    weights: List[float] = []
-    for drag in drags:
-        points = len(drag)
-        duration_ms = sum(pt[2] for pt in drag)
-        if points < 25 or duration_ms < 800:
-            weights.append(0.25)
-            continue
-        weights.append(1.0 + min(points, 80) / 25.0 + min(duration_ms, 1800) / 900.0)
-    return random.choices(drags, weights=weights, k=1)[0]
+    """选择轨迹，避免连续选同一条（轮换策略）。"""
+    global _last_trail_index
+    if len(drags) <= 1:
+        _last_trail_index = 0
+        return drags[0] if drags else []
+    # 排除上次选中的，从剩余中随机选
+    candidates = [i for i in range(len(drags)) if i != _last_trail_index]
+    chosen = random.choice(candidates)
+    _last_trail_index = chosen
+    return drags[chosen]
 
 
 class PlaywrightSliderService:
@@ -641,12 +644,21 @@ class PlaywrightSliderService:
                         failure_records.append(failure_info)
 
                         if attempt < max_retries:
-                            time.sleep(random.uniform(1, 2))
+                            # 真人轨迹模式：失败后点重试按钮重置滑块，下次换一条轨迹
+                            if self._human_trail_mode:
+                                logger.info(f"【{self.pure_user_id}】真人轨迹回放失败，点击重试按钮重置滑块")
+                                self._click_slider_refresh()
+                                time.sleep(random.uniform(1.5, 2.5))
+                            else:
+                                time.sleep(random.uniform(1, 2))
                             continue
 
                 except Exception as e:
                     logger.error(f"【{self.pure_user_id}】第{attempt}次处理滑块验证时出错: {str(e)}")
                     if attempt < max_retries:
+                        if self._human_trail_mode:
+                            self._click_slider_refresh()
+                            time.sleep(random.uniform(1.5, 2.5))
                         continue
 
             # 所有尝试都失败了
@@ -1100,12 +1112,21 @@ class PlaywrightSliderService:
                         failure_records.append(failure_info)
 
                         if attempt < max_retries:
-                            time.sleep(random.uniform(1, 2))
+                            # 真人轨迹模式：失败后点重试按钮重置滑块，下次换一条轨迹
+                            if self._human_trail_mode:
+                                logger.info(f"【{self.pure_user_id}】真人轨迹回放失败，点击重试按钮重置滑块")
+                                self._click_slider_refresh()
+                                time.sleep(random.uniform(1.5, 2.5))
+                            else:
+                                time.sleep(random.uniform(1, 2))
                             continue
 
                 except Exception as e:
                     logger.error(f"【{self.pure_user_id}】第{attempt}次处理滑块验证时出错: {str(e)}")
                     if attempt < max_retries:
+                        if self._human_trail_mode:
+                            self._click_slider_refresh()
+                            time.sleep(random.uniform(1.5, 2.5))
                         continue
 
             # 所有尝试都失败了
