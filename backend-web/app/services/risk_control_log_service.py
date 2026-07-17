@@ -13,31 +13,89 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import select, func, case, and_
+from sqlalchemy import select, func, case, and_, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.models.risk_control_log import XYRiskControlLog
+from common.models.xy_account import XYAccount
 from common.utils.pagination import execute_paginated_with_filters
 
 
 from common.utils.time_utils import safe_isoformat, get_beijing_now_naive
 class RiskControlLogService:
-    """Read-only access to risk control logs."""
+    """Access to risk control logs."""
 
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def count_processing_slider_logs(self) -> int:
-        """统计数据库中全部处理中的滑块风控日志。
+    async def count_remote_processing_slider_logs(self) -> int:
+        """统计数据库中全部处理中的远程滑块风控日志。
 
         Returns:
-            本机和远程调用合计的处理中滑块日志数量。
+            远程调用的处理中滑块日志数量。
         """
         stmt = select(func.count(XYRiskControlLog.id)).where(
             XYRiskControlLog.event_type == "slider_captcha",
             XYRiskControlLog.processing_status == "processing",
+            XYRiskControlLog.call_type == "remote",
         )
         return int((await self.session.execute(stmt)).scalar_one() or 0)
+
+    async def create_remote_processing_slider_log(
+        self,
+        *,
+        account_identifier: str,
+        url: str,
+        call_user: str | None,
+    ) -> int:
+        """创建远程滑块 processing 日志并立即提交。"""
+        account_row = (
+            await self.session.execute(
+                select(XYAccount.id, XYAccount.owner_id).where(
+                    XYAccount.account_id == account_identifier
+                )
+            )
+        ).first()
+
+        log = XYRiskControlLog(
+            owner_id=account_row.owner_id if account_row else None,
+            account_pk=account_row.id if account_row else None,
+            account_identifier=account_identifier,
+            event_type="slider_captcha",
+            event_description=f"触发场景: 远程过滑块接口, URL: {url}",
+            processing_status="processing",
+            call_type="remote",
+            call_user=call_user,
+        )
+        self.session.add(log)
+        await self.session.flush()
+        log_id = int(log.id)
+        await self.session.commit()
+        return log_id
+
+    async def mark_remote_slider_log_unclaimed(
+        self,
+        *,
+        log_id: int,
+        error_message: str,
+    ) -> bool:
+        """将未被 websocket 接管的预建日志从 processing 置为 cancelled。"""
+        result = await self.session.execute(
+            update(XYRiskControlLog)
+            .where(
+                XYRiskControlLog.id == log_id,
+                XYRiskControlLog.event_type == "slider_captcha",
+                XYRiskControlLog.processing_status == "processing",
+                XYRiskControlLog.call_type == "remote",
+            )
+            .values(
+                processing_status="cancelled",
+                processing_result="预建远程过滑块日志未被 websocket 接管",
+                error_message=error_message,
+            )
+        )
+        await self.session.commit()
+        return bool(result.rowcount)
 
     async def list_logs(
         self,
@@ -141,6 +199,8 @@ class RiskControlLogService:
         说明：
         - 处理中（'processing'）与已取消（'cancelled'）的记录不计入成功率统计，分子和分母都排除，
           成功率仅统计已出结果（success/failed）的记录；处理中记录以总数、本机数、远程数单独返回。
+        - 「验证链接已过期」的失败记录（processing_result 含"验证链接已过期"）同样不计入成功率，
+          这类失败是调用方传入的链接失效导致，需刷新URL重试，不反映过滑块本身的成败。
         - 远程口径为 call_type == 'remote'；其余（含 'local' 与 NULL）一律计入本机，
           保证 本机数 + 远程数 == 总数，三个维度各自使用自己的分母，避免分母用错。
         - 普通用户仅统计自己的账号数据，管理员统计全部数据（由 owner_id 控制）。
@@ -166,8 +226,18 @@ class RiskControlLogService:
         is_success = XYRiskControlLog.processing_status == "success"
         is_remote = XYRiskControlLog.call_type == "remote"
         is_processing = XYRiskControlLog.processing_status == "processing"
-        # 成功率口径：仅统计已出结果的记录，排除处理中（processing）与已取消（cancelled）
-        is_settled = XYRiskControlLog.processing_status.notin_(["processing", "cancelled"])
+        # 验证链接已过期的失败记录：链接失效属于调用方问题，不反映过滑块本身成败，排除出成功率
+        # （processing_result 为 NULL 时 LIKE 结果为 NULL，需显式放行 NULL 记录）
+        not_url_expired = or_(
+            XYRiskControlLog.processing_result.is_(None),
+            XYRiskControlLog.processing_result.notlike("%验证链接已过期%"),
+        )
+        # 成功率口径：仅统计已出结果的记录，排除处理中（processing）、已取消（cancelled）
+        # 与「验证链接已过期」的失败记录
+        is_settled = and_(
+            XYRiskControlLog.processing_status.notin_(["processing", "cancelled"]),
+            not_url_expired,
+        )
 
         # 一次查询用条件聚合得到：总数、成功数、远程总数、远程成功数、处理中数、远程处理中数
         # 成功率相关的 total/success/remote_* 均只计入已出结果（settled）记录，
