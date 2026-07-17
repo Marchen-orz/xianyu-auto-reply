@@ -98,6 +98,12 @@ class BaseConfig(BaseSettings):
     # Docker / 无头 Linux 环境必须保持关闭（无桌面无法驱动物理鼠标），故默认 False。
     captcha_real_mouse_enabled: bool = Field(default=False, alias="CAPTCHA_REAL_MOUSE")
 
+    # 滑块验证 - 真人轨迹回放模式（CDP鼠标 + 真人录制轨迹 + 真实鼠标引擎同款浏览器环境）
+    # 开启后：主引擎复刻真实鼠标引擎的浏览器环境（channel=chrome, no_viewport, real_mouse_shared目录），
+    #         加载真人录制轨迹用 CDP page.mouse 回放；跳过 DrissionPage 兜底。
+    # 适用于想用真人轨迹但无物理桌面的环境（Linux/Xvfb 等）。
+    captcha_human_trail_enabled: bool = Field(default=False, alias="CAPTCHA_HUMAN_TRAIL")
+
     @property
     def database_url(self) -> str:
         """同步数据库连接URL"""
