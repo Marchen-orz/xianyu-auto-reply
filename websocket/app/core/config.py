@@ -49,7 +49,12 @@ class WebSocketConfig(BaseConfig):
     captcha_drissionpage_headless: bool = Field(
         default=True, alias="CAPTCHA_DRISSIONPAGE_HEADLESS"
     )
-    
+
+    # 真人轨迹回放模式（CDP鼠标 + 真人录制轨迹 + 真实鼠标引擎同款浏览器环境）
+    captcha_human_trail_enabled: bool = Field(
+        default=False, alias="CAPTCHA_HUMAN_TRAIL"
+    )
+
     # 服务间通信URL
     backend_web_service_url: str = Field(
         default="http://localhost:8089",
