@@ -258,10 +258,29 @@ export const getRiskLogs = async (params?: {
   return { success: Boolean(result.success), data: logs, total: result.total, message: result.message }
 }
 
+export interface LocalSliderConfig {
+  enabled: boolean
+}
+
+// 读取“本机滑块不处理”开关（仅管理员）
+export const getLocalSliderConfig = async (): Promise<ApiResponse<LocalSliderConfig>> => {
+  return get(`${API_PREFIX}/risk-control-logs/local-slider-config`)
+}
+
+// 实时更新“本机滑块不处理”开关（仅管理员）
+export const updateLocalSliderConfig = async (enabled: boolean): Promise<ApiResponse<LocalSliderConfig>> => {
+  return put(`${API_PREFIX}/risk-control-logs/local-slider-config`, { enabled })
+}
+
 // 清空风控日志
 export const clearRiskLogs = async (cookieId?: string): Promise<ApiResponse> => {
   const query = cookieId ? `?cookie_id=${cookieId}` : ''
   return del(`${ADMIN_PREFIX}/risk-control-logs${query}`)
+}
+
+// 清空处理中的风控日志（仅删除 processing_status=processing 的记录）
+export const clearProcessingRiskLogs = async (): Promise<ApiResponse> => {
+  return del(`${ADMIN_PREFIX}/risk-control-logs?processing_status=processing`)
 }
 
 // 当日风控成功率（含总体 / 本机 / 远程三个维度）
