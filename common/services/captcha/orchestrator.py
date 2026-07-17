@@ -349,8 +349,8 @@ def run_slider_verification_with_fallback(
     if ok2 and _has_x5sec(cookies2):
         return True, cookies2, "drissionpage"
 
-    # 4. 兜底也未取得 x5sec：优先保留主引擎"成功但无 x5sec"的结果，
-    #    以维持上层原有的"无 x5sec 不计入禁用"语义。
-    if ok and cookies:
-        return ok, cookies, "playwright"
-    return ok2, cookies2, None
+    # 4. 兜底也未取得 x5sec：返回失败。
+    #    之前保留主引擎"成功但无 x5sec"的结果会导致风控日志误判为成功。
+    if ok2 and cookies2:
+        return ok2, cookies2, None
+    return False, None, None
