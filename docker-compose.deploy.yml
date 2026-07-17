@@ -1,6 +1,6 @@
-# Docker Compose 配置文件
-# 闲鱼自动回复系统 - 本地源码构建
-# 用法: docker compose up -d --build
+# Docker Compose 配置文件 - 远程镜像部署版
+# 闲鱼自动回复系统 - 从镜像仓库拉取预构建镜像
+# 由 deploy.sh 自动生成，请勿手动修改
 
 services:
   # ====== 基础设施 ======
@@ -29,7 +29,7 @@ services:
     networks:
       - xianyu-network
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-xianyu@2026}"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-xianyu@2026}"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -61,13 +61,11 @@ services:
       retries: 5
       start_period: 10s
 
-  # ====== 应用服务 ======
+  # ====== 应用服务（远程镜像） ======
 
   # Backend-Web 服务
   backend-web:
-    build:
-      context: .
-      dockerfile: backend-web/Dockerfile
+    image: ${IMAGE_REGISTRY:-registry.cn-shanghai.aliyuncs.com/zhinian-software}/xianyu-backend-web:${IMAGE_TAG:-latest}
     container_name: xianyu-backend-web
     restart: unless-stopped
     environment:
@@ -103,8 +101,8 @@ services:
       - BROWSER_HEADLESS=true
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - SQL_ECHO=${SQL_ECHO:-true}
-      - TOKEN_CACHE_TTL_MIN_HOURS=${TOKEN_CACHE_TTL_MIN_HOURS:-5}
-      - TOKEN_CACHE_TTL_MAX_HOURS=${TOKEN_CACHE_TTL_MAX_HOURS:-10}
+      - TOKEN_CACHE_TTL_MIN_HOURS=${TOKEN_CACHE_TTL_MIN_HOURS:-4}
+      - TOKEN_CACHE_TTL_MAX_HOURS=${TOKEN_CACHE_TTL_MAX_HOURS:-7}
       - TZ=Asia/Shanghai
     volumes:
       - ./xianyu_auto_reply/logs/backend_web:/app/backend-web/logs
@@ -128,9 +126,7 @@ services:
 
   # WebSocket 服务
   websocket:
-    build:
-      context: .
-      dockerfile: websocket/Dockerfile
+    image: ${IMAGE_REGISTRY:-registry.cn-shanghai.aliyuncs.com/zhinian-software}/xianyu-websocket:${IMAGE_TAG:-latest}
     container_name: xianyu-websocket
     restart: unless-stopped
     environment:
@@ -156,8 +152,8 @@ services:
       - STATIC_DIR=/app/static
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - SQL_ECHO=${SQL_ECHO:-true}
-      - TOKEN_CACHE_TTL_MIN_HOURS=${TOKEN_CACHE_TTL_MIN_HOURS:-5}
-      - TOKEN_CACHE_TTL_MAX_HOURS=${TOKEN_CACHE_TTL_MAX_HOURS:-10}
+      - TOKEN_CACHE_TTL_MIN_HOURS=${TOKEN_CACHE_TTL_MIN_HOURS:-4}
+      - TOKEN_CACHE_TTL_MAX_HOURS=${TOKEN_CACHE_TTL_MAX_HOURS:-7}
       - TZ=Asia/Shanghai
     volumes:
       - ./xianyu_auto_reply/logs/websocket:/app/websocket/logs
@@ -183,9 +179,7 @@ services:
 
   # Scheduler 服务
   scheduler:
-    build:
-      context: .
-      dockerfile: scheduler/Dockerfile
+    image: ${IMAGE_REGISTRY:-registry.cn-shanghai.aliyuncs.com/zhinian-software}/xianyu-scheduler:${IMAGE_TAG:-latest}
     container_name: xianyu-scheduler
     restart: unless-stopped
     environment:
@@ -236,9 +230,7 @@ services:
 
   # 前端服务
   frontend:
-    build:
-      context: .
-      dockerfile: docker/frontend/Dockerfile
+    image: ${IMAGE_REGISTRY:-registry.cn-shanghai.aliyuncs.com/zhinian-software}/xianyu-frontend:${IMAGE_TAG:-latest}
     container_name: xianyu-frontend
     restart: unless-stopped
     environment:
@@ -254,4 +246,3 @@ services:
 networks:
   xianyu-network:
     driver: bridge
-

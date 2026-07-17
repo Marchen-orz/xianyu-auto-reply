@@ -30,7 +30,7 @@ deps = tomllib.load(open('/app/backend-web/pyproject.toml','rb')).get('project',
 open('/tmp/requirements.txt','w').write('\n'.join(deps))" && \
     pip install --no-cache-dir -r /tmp/requirements.txt
 
-RUN python -m playwright install --with-deps chromium
+RUN python -m playwright install --with-deps --force chrome
 
 # 创建日志目录
 RUN mkdir -p /app/backend-web/logs /app/static/uploads

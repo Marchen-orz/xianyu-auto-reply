@@ -465,8 +465,6 @@ async def solve_captcha(request: SolveCaptchaRequest):
         weight_class = "remote_cookie" if existing_cookies_str else "remote"
         slider_args = (
             safe_id, url, True, False, timeout, existing_cookies_str, url_provider,
-            remote_config=remote_config,
-            weight_class=remote_weight_class,
         )
         if is_real_mouse_enabled():
             # 被调用方请求在线程池之前参与本地/远程实时加权排队。

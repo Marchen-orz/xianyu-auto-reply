@@ -143,11 +143,11 @@ def get_chromium_executable_path() -> Optional[str]:
     browser_dir = get_playwright_browser_dir()
     if browser_dir and browser_dir.exists():
         try:
-            chromium_dirs = [
+            chrome_dirs = [
                 d for d in browser_dir.iterdir()
-                if d.is_dir() and "chromium" in d.name.lower()
+                if d.is_dir() and ("chromium" in d.name.lower() or "chrome" in d.name.lower())
             ]
-            for cdir in chromium_dirs:
+            for cdir in chrome_dirs:
                 candidates = [
                     cdir / "chrome-win64" / "chrome.exe",
                     cdir / "chrome-win" / "chrome.exe",
@@ -161,8 +161,10 @@ def get_chromium_executable_path() -> Optional[str]:
         except Exception as e:
             logger.warning(f"定位 Chromium 可执行文件失败: {e}")
 
-    # 回退：检查系统安装的 Chromium
+    # 回退：检查系统安装的 Chrome / Chromium
     for candidate in (
+        Path("/usr/bin/google-chrome-stable"),
+        Path("/usr/bin/google-chrome"),
         Path("/usr/bin/chromium-browser"),
         Path("/usr/bin/chromium"),
     ):
