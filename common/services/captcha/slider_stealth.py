@@ -3,9 +3,15 @@ Playwright滑块验证服务
 
 基于Playwright实现滑块验证，支持反检测和轨迹学习
 复刻原始 utils/xianyu_slider_stealth.py 的核心逻辑
+
+CAPTCHA_HUMAN_TRAIL 模式：
+  复刻真实鼠标引擎的浏览器环境（channel=chrome, no_viewport, real_mouse_shared 目录），
+  加载真人录制轨迹用 CDP page.mouse 回放，不走 DrissionPage 兜底。
 """
 from __future__ import annotations
 
+import glob
+import json
 import os
 import random
 import re
@@ -65,6 +71,126 @@ _CAP_JS = r"""
   }, true);
 })();
 """
+
+
+# ── 真人轨迹回放模式 ──────────────────────────────────────────────────────
+
+# 真人鼠标模式专用固定目录（与 real_mouse_slider.py 一致）
+_HUMAN_TRAIL_BROWSER_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "browser_data", "real_mouse_shared")
+)
+
+# 真人轨迹模式专用的精简浏览器参数（复刻 real_mouse_slider.py 的 _BROWSER_ARGS）
+_HUMAN_TRAIL_BROWSER_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-infobars",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-popup-blocking",
+    "--force-color-profile=srgb",
+    "--lang=zh-CN",
+    "--start-maximized",
+]
+
+
+def _is_human_trail_enabled() -> bool:
+    """读取 CAPTCHA_HUMAN_TRAIL 开关。"""
+    env_val = os.environ.get("CAPTCHA_HUMAN_TRAIL", "").lower()
+    if env_val in ("true", "1", "yes"):
+        return True
+    if env_val in ("false", "0", "no"):
+        return False
+    try:
+        from app.core.config import get_settings
+        return bool(getattr(get_settings(), "captcha_human_trail_enabled", False))
+    except Exception:
+        pass
+    try:
+        from common.core.config import get_settings
+        return bool(getattr(get_settings(), "captcha_human_trail_enabled", False))
+    except Exception:
+        return False
+
+
+def _trails_dir() -> str:
+    """真人轨迹样本目录。"""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_trails")
+
+
+def _load_human_trail_drags() -> List[List[Tuple[float, float, float]]]:
+    """加载真人通过的业务滑块轨迹（与 real_mouse_slider.py 逻辑一致）。"""
+    pattern = "human_trail_pass_*.json"
+    files = sorted(glob.glob(os.path.join(_trails_dir(), pattern)))
+    preferred_name = "human_trail_pass_1783949589.json"
+    preferred_path = os.path.join(_trails_dir(), preferred_name)
+    if os.path.isfile(preferred_path):
+        files = [preferred_path] + [f for f in files if f != preferred_path]
+
+    drags: List[List[Tuple[float, float, float]]] = []
+    for f in files:
+        try:
+            data = json.load(open(f, encoding="utf-8"))
+            trail = data.get("trail", [])
+        except Exception as e:
+            logger.warning(f"加载真人轨迹失败 {f}: {e}")
+            continue
+        moves = [e for e in trail if isinstance(e, list) and len(e) >= 5 and e[0] == "mousemove"]
+        seg = [e for e in moves if e[4] == 1]
+        if len(seg) < 5:
+            continue
+        while len(seg) > 2:
+            gap = seg[-1][3] - seg[-2][3]
+            dx = seg[-1][1] - seg[-2][1]
+            dy = seg[-1][2] - seg[-2][2]
+            if gap > 250.0 and abs(dx) <= 1.0 and abs(dy) <= 1.0:
+                seg.pop()
+                continue
+            break
+        x0, y0, prev = seg[0][1], seg[0][2], seg[0][3]
+        rel: List[Tuple[float, float, float]] = []
+        for p in seg:
+            dt = max(0.0, min(180.0, p[3] - prev))
+            rel.append((p[1] - x0, p[2] - y0, dt))
+            prev = p[3]
+        duration_ms = sum(pt[2] for pt in rel)
+        distance = rel[-1][0]
+        if len(rel) < 20 or duration_ms < 350 or duration_ms > 2600:
+            continue
+        if distance < 120 or distance > 1200:
+            continue
+        drags.append(rel)
+    return drags
+
+
+def _scale_trail_to_distance(
+    drag: List[Tuple[float, float, float]], distance: float,
+) -> List[Tuple[float, float, float]]:
+    if not drag or distance <= 0 or drag[-1][0] <= 1:
+        return drag
+    factor = distance / drag[-1][0]
+    scaled = [(dx * factor, dy, dt) for dx, dy, dt in drag]
+    scaled[-1] = (distance, scaled[-1][1], scaled[-1][2])
+    return scaled
+
+
+# 上次选中的轨迹索引，用于避免连续选同一条
+_last_trail_index = -1
+
+
+def _choose_trail_drag(drags: List[List[Tuple[float, float, float]]]) -> List[Tuple[float, float, float]]:
+    """选择轨迹，避免连续选同一条（轮换策略）。"""
+    global _last_trail_index
+    if len(drags) <= 1:
+        _last_trail_index = 0
+        return drags[0] if drags else []
+    # 排除上次选中的，从剩余中随机选
+    candidates = [i for i in range(len(drags)) if i != _last_trail_index]
+    chosen = random.choice(candidates)
+    _last_trail_index = chosen
+    return drags[chosen]
 
 
 class PlaywrightSliderService:
@@ -154,8 +280,14 @@ class PlaywrightSliderService:
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
 
-        # 持久化用户数据目录（参照旧框架）
-        self.user_data_dir = os.path.join(os.getcwd(), 'browser_data', f'user_{self.pure_user_id}')
+        # 真人轨迹回放模式：复刻真实鼠标引擎的共享浏览器目录
+        self._human_trail_mode = _is_human_trail_enabled()
+        if self._human_trail_mode:
+            self.user_data_dir = _HUMAN_TRAIL_BROWSER_DIR
+            logger.info(f"【{self.pure_user_id}】真人轨迹回放模式：使用共享浏览器目录 {self.user_data_dir}")
+        else:
+            # 持久化用户数据目录（参照旧框架）
+            self.user_data_dir = os.path.join(os.getcwd(), 'browser_data', f'user_{self.pure_user_id}')
         os.makedirs(self.user_data_dir, exist_ok=True)
         logger.debug(f"【{self.pure_user_id}】使用用户数据目录: {self.user_data_dir}")
 
@@ -280,34 +412,43 @@ class PlaywrightSliderService:
             self.playwright = sync_playwright().start()
             logger.info(f"【{self.pure_user_id}】Playwright启动成功")
 
-            browser_features = get_random_browser_features()
-
-            # 构建启动参数
-            args = self.BROWSER_ARGS.copy()
-            args.append(f"--window-size={browser_features['window_size']}")
-            args.append(f"--lang={browser_features['lang']}")
-            args.append(f"--accept-lang={browser_features['accept_lang']}")
-
-            logger.info(f"【{self.pure_user_id}】启动浏览器，headless模式: {self.headless}")
-            logger.info(f"【{self.pure_user_id}】使用用户数据目录: {self.user_data_dir}")
-            
-            # 使用持久化上下文（参照旧框架，保存登录状态）
-            launch_kwargs = {
-                'headless': self.headless,
-                'args': args,
-                'viewport': {'width': 1980, 'height': 1024},
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-                'locale': 'zh-CN',
-                'accept_downloads': True,
-                'ignore_https_errors': True,
-                'extra_http_headers': {
-                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+            # ── 真人轨迹回放模式：复刻真实鼠标引擎的浏览器环境 ──
+            if self._human_trail_mode:
+                logger.info(f"【{self.pure_user_id}】真人轨迹回放模式：使用真实鼠标引擎同款浏览器环境")
+                launch_kwargs = {
+                    'channel': 'chrome',        # 本机真实 Chrome（自然指纹）
+                    'headless': self.headless,   # 跟随 BROWSER_HEADLESS 配置
+                    'args': _HUMAN_TRAIL_BROWSER_ARGS,
+                    'no_viewport': True,        # 不强制 viewport，保留真实窗口尺寸
+                    'locale': 'zh-CN',
+                    'timezone_id': 'Asia/Shanghai',
+                    'ignore_https_errors': True,
+                    'extra_http_headers': {'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'},
                 }
-            }
-            executable_path = self._find_browser_executable()
-            if executable_path:
-                launch_kwargs['executable_path'] = executable_path
-                logger.info(f"【{self.pure_user_id}】使用 Chromium 可执行文件: {executable_path}")
+            else:
+                # ── 默认模式：原有 Playwright Chromium 环境 ──
+                browser_features = get_random_browser_features()
+                args = self.BROWSER_ARGS.copy()
+                args.append(f"--window-size={browser_features['window_size']}")
+                args.append(f"--lang={browser_features['lang']}")
+                args.append(f"--accept-lang={browser_features['accept_lang']}")
+
+                launch_kwargs = {
+                    'headless': self.headless,
+                    'args': args,
+                    'viewport': {'width': 1980, 'height': 1024},
+                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+                    'locale': 'zh-CN',
+                    'accept_downloads': True,
+                    'ignore_https_errors': True,
+                    'extra_http_headers': {
+                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+                    }
+                }
+                executable_path = self._find_browser_executable()
+                if executable_path:
+                    launch_kwargs['executable_path'] = executable_path
+                    logger.info(f"【{self.pure_user_id}】使用 Chromium 可执行文件: {executable_path}")
 
             # 启动前清理可能残留的 Singleton 锁文件（已持有账号锁，清理是安全的）
             self._clean_singleton_lock_files()
@@ -503,12 +644,21 @@ class PlaywrightSliderService:
                         failure_records.append(failure_info)
 
                         if attempt < max_retries:
-                            time.sleep(random.uniform(1, 2))
+                            # 真人轨迹模式：失败后点重试按钮重置滑块，下次换一条轨迹
+                            if self._human_trail_mode:
+                                logger.info(f"【{self.pure_user_id}】真人轨迹回放失败，点击重试按钮重置滑块")
+                                self._click_slider_refresh()
+                                time.sleep(random.uniform(1.5, 2.5))
+                            else:
+                                time.sleep(random.uniform(1, 2))
                             continue
 
                 except Exception as e:
                     logger.error(f"【{self.pure_user_id}】第{attempt}次处理滑块验证时出错: {str(e)}")
                     if attempt < max_retries:
+                        if self._human_trail_mode:
+                            self._click_slider_refresh()
+                            time.sleep(random.uniform(1.5, 2.5))
                         continue
 
             # 所有尝试都失败了
@@ -962,12 +1112,21 @@ class PlaywrightSliderService:
                         failure_records.append(failure_info)
 
                         if attempt < max_retries:
-                            time.sleep(random.uniform(1, 2))
+                            # 真人轨迹模式：失败后点重试按钮重置滑块，下次换一条轨迹
+                            if self._human_trail_mode:
+                                logger.info(f"【{self.pure_user_id}】真人轨迹回放失败，点击重试按钮重置滑块")
+                                self._click_slider_refresh()
+                                time.sleep(random.uniform(1.5, 2.5))
+                            else:
+                                time.sleep(random.uniform(1, 2))
                             continue
 
                 except Exception as e:
                     logger.error(f"【{self.pure_user_id}】第{attempt}次处理滑块验证时出错: {str(e)}")
                     if attempt < max_retries:
+                        if self._human_trail_mode:
+                            self._click_slider_refresh()
+                            time.sleep(random.uniform(1.5, 2.5))
                         continue
 
             # 所有尝试都失败了
@@ -990,16 +1149,20 @@ class PlaywrightSliderService:
             return False
 
     def _simulate_slide(self, slider_button: ElementHandle, trajectory: List[Tuple[float, float, float]]) -> bool:
-        """模拟滑动 - 优化版本
-        
+        """模拟滑动
+
         Args:
             slider_button: 滑块按钮元素
-            trajectory: 轨迹点列表
-            
+            trajectory: 轨迹点列表（默认模式使用；真人轨迹模式忽略此参数）
+
         Returns:
             是否执行成功
         """
         try:
+            # 真人轨迹回放模式
+            if self._human_trail_mode:
+                return self._simulate_slide_human_trail(slider_button)
+
             logger.info(f"【{self.pure_user_id}】开始优化滑动模拟...")
 
             # 等待页面稳定
@@ -1134,6 +1297,150 @@ class PlaywrightSliderService:
             logger.error(f"【{self.pure_user_id}】滑动模拟异常: {e}")
             import traceback
             logger.error(traceback.format_exc())
+            return False
+
+    def _simulate_slide_human_trail(self, slider_button: ElementHandle) -> bool:
+        """真人轨迹回放：加载真人录制的轨迹，用 CDP page.mouse 回放。
+
+        浏览器环境已复刻真实鼠标引擎（channel=chrome, no_viewport, real_mouse_shared），
+        轨迹加载/缩放逻辑与 real_mouse_slider.py 完全一致。
+        """
+        try:
+            drags = _load_human_trail_drags()
+            if not drags:
+                logger.error(f"【{self.pure_user_id}】真人轨迹回放：无可用样本")
+                return False
+
+            time.sleep(random.uniform(0.1, 0.3))
+
+            button_box = slider_button.bounding_box()
+            if not button_box:
+                logger.error(f"【{self.pure_user_id}】真人轨迹回放：无法获取滑块按钮位置")
+                return False
+
+            start_x = button_box["x"] + button_box["width"] / 2
+            start_y = button_box["y"] + button_box["height"] / 2
+
+            # 计算滑动距离（优先 DOM 精确计算，与真实鼠标引擎一致）
+            slide_distance = 0.0
+            detected_frame = self.element_finder.get_detected_frame()
+            if detected_frame:
+                try:
+                    slide_distance = detected_frame.evaluate(
+                        """() => {
+                            const btn = document.querySelector('#nc_1_n1z');
+                            const trk = document.querySelector('#nc_1_n1t') || document.querySelector('.nc_scale');
+                            if (!btn || !trk) return null;
+                            return trk.getBoundingClientRect().width - btn.getBoundingClientRect().width;
+                        }"""
+                    )
+                    if slide_distance and slide_distance > 0:
+                        slide_distance = float(slide_distance)
+                except Exception:
+                    pass
+            if slide_distance <= 0:
+                try:
+                    for frame in self.page.frames:
+                        track_el = frame.query_selector("#nc_1_n1t") or frame.query_selector(".nc_scale")
+                        if track_el:
+                            track_box = track_el.bounding_box()
+                            if track_box and button_box:
+                                slide_distance = track_box["width"] - button_box["width"]
+                                break
+                except Exception:
+                    pass
+            if slide_distance <= 0:
+                logger.error(f"【{self.pure_user_id}】真人轨迹回放：无法确定滑动距离")
+                return False
+
+            # 选择并缩放轨迹
+            selected_drag = _choose_trail_drag(drags)
+            source_distance = selected_drag[-1][0]
+            scaled_drag = _scale_trail_to_distance(selected_drag, slide_distance)
+            logger.info(
+                f"【{self.pure_user_id}】真人轨迹回放：点数={len(scaled_drag)}, "
+                f"位移={source_distance:.1f}px->{slide_distance:.1f}px, "
+                f"时长={sum(pt[2] for pt in scaled_drag):.0f}ms"
+            )
+
+            # 接近 → 悬停 → 按下
+            try:
+                self.page.mouse.move(
+                    start_x + random.uniform(-40, -15),
+                    start_y + random.uniform(-20, 20),
+                    steps=random.randint(8, 15),
+                )
+                time.sleep(random.uniform(0.2, 0.4))
+                self.page.mouse.move(start_x, start_y, steps=random.randint(5, 8))
+                time.sleep(random.uniform(0.15, 0.3))
+            except Exception as e:
+                logger.warning(f"【{self.pure_user_id}】真人轨迹回放：接近失败: {e}")
+            try:
+                slider_button.hover(timeout=2000)
+                time.sleep(random.uniform(0.1, 0.3))
+            except Exception:
+                pass
+            try:
+                self.page.mouse.move(start_x, start_y)
+                time.sleep(random.uniform(0.05, 0.15))
+                self.page.mouse.down()
+                time.sleep(random.uniform(0.08, 0.15))
+            except Exception as e:
+                logger.error(f"【{self.pure_user_id}】真人轨迹回放：按下失败: {e}")
+                return False
+
+            # 回放真人轨迹
+            try:
+                start_time = time.time()
+                current_x = start_x
+                current_y = start_y
+
+                for i, (dx, dy, dt) in enumerate(scaled_drag):
+                    current_x = start_x + dx
+                    current_y = start_y + dy
+                    self.page.mouse.move(current_x, current_y, steps=1)
+
+                    if dt > 0:
+                        # CDP RTT 补偿：真人轨迹 dt 是毫秒级精密时序，
+                        # CDP 传输本身有 ~80ms 延迟，实际 sleep 要减去这部分
+                        cdp_rtt = 0.08
+                        sleep_time = max(0.0, dt / 1000.0 - cdp_rtt)
+                        if sleep_time > 0:
+                            time.sleep(sleep_time * random.uniform(0.85, 1.15))
+
+                    if i == len(scaled_drag) - 1:
+                        try:
+                            style = slider_button.get_attribute("style")
+                            if style and "left:" in style:
+                                m = re.search(r'left:\s*([^;]+)', style)
+                                if m:
+                                    left_px = float(m.group(1).strip().replace('px', ''))
+                                    self.trajectory_generator.update_trajectory_data("final_left_px", left_px)
+                                    logger.info(f"【{self.pure_user_id}】真人轨迹回放完成: {len(scaled_drag)}步, 最终位置={left_px:.1f}px")
+                        except Exception:
+                            pass
+
+                # 刮刮乐
+                if self.verification_checker.is_scratch_captcha():
+                    time.sleep(random.uniform(0.3, 0.5))
+
+                time.sleep(random.uniform(0.02, 0.05))
+                self.page.mouse.up()
+
+                elapsed = time.time() - start_time
+                logger.info(f"【{self.pure_user_id}】真人轨迹回放完成: 耗时={elapsed:.2f}s")
+                return True
+
+            except Exception as e:
+                logger.error(f"【{self.pure_user_id}】真人轨迹回放执行失败: {e}")
+                try:
+                    self.page.mouse.up()
+                except Exception:
+                    pass
+                return False
+
+        except Exception as e:
+            logger.error(f"【{self.pure_user_id}】真人轨迹回放异常: {e}")
             return False
 
     def _get_cookies_after_success(self) -> Optional[Dict[str, str]]:

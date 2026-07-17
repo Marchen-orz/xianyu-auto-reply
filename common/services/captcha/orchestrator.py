@@ -73,6 +73,26 @@ def _real_mouse_enabled() -> bool:
     return bool(getattr(settings, "captcha_real_mouse_enabled", False))
 
 
+def _is_human_trail_enabled() -> bool:
+    """读取 CAPTCHA_HUMAN_TRAIL 开关。"""
+    import os
+    env_val = os.environ.get("CAPTCHA_HUMAN_TRAIL", "").lower()
+    if env_val in ("true", "1", "yes"):
+        return True
+    if env_val in ("false", "0", "no"):
+        return False
+    try:
+        from app.core.config import get_settings
+        return bool(getattr(get_settings(), "captcha_human_trail_enabled", False))
+    except Exception:
+        pass
+    try:
+        from common.core.config import get_settings
+        return bool(getattr(get_settings(), "captcha_human_trail_enabled", False))
+    except Exception:
+        return False
+
+
 def is_real_mouse_enabled() -> bool:
     """返回真实鼠标开关，供线程池前置权重入口复用。"""
     return _real_mouse_enabled()
@@ -292,6 +312,10 @@ def run_slider_verification_with_fallback(
         return False, None, "url_expired"
 
     # 2. 判断是否需要兜底
+    #    真人轨迹回放模式只用主引擎，不走 DrissionPage 兜底
+    if _is_human_trail_enabled():
+        logger.info(f"【{user_id}】真人轨迹回放模式，跳过 DrissionPage 兜底")
+        return ok, cookies, ("playwright" if (ok and cookies) else None)
     fallback_enabled, fb_headless, fb_timeout = _load_fallback_config()
     if not fallback_enabled or not DRISSIONPAGE_AVAILABLE:
         if not fallback_enabled:
