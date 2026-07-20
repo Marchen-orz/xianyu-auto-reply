@@ -47,7 +47,7 @@ from common.services.captcha.win_input import (
     timer_resolution,
 )
 
-from playwright.sync_api import sync_playwright
+from patchright.sync_api import sync_playwright
 
 # —— 惰性/可选依赖：仅在有桌面的 Windows 上可用，导入失败则标记为不可用 ——
 try:

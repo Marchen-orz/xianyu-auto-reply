@@ -30,7 +30,7 @@ if os.getenv('DOCKER_ENV'):
         logger.warning(f"设置SelectorEventLoop失败: {e}")
 
 try:
-    from playwright.async_api import async_playwright, Page, BrowserContext, Browser
+    from patchright.async_api import async_playwright, Page, BrowserContext, Browser
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
@@ -102,18 +102,15 @@ class BrowserManager:
                 browser_args.extend(self.DOCKER_BROWSER_ARGS)
 
             logger.info("正在启动浏览器（中文模式，持久化缓存）...")
-            chromium_path = get_chromium_executable_path()
 
-            # 使用持久化上下文
+            # 使用持久化上下文（系统真实 Chrome，自然指纹）
             launch_kwargs = dict(
+                channel='chrome',
                 headless=headless,
                 args=browser_args,
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 viewport={'width': 1280, 'height': 720},
                 locale='zh-CN',
             )
-            if chromium_path:
-                launch_kwargs["executable_path"] = chromium_path
             self.context = await self.playwright.chromium.launch_persistent_context(
                 self._user_data_dir,
                 **launch_kwargs,

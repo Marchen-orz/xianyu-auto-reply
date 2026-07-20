@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from loguru import logger
-from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+from patchright.async_api import Browser, BrowserContext, Page, async_playwright
 from common.utils.browser_utils import ensure_playwright_browser_path, get_chromium_executable_path
 from common.services.publish_image_service import cleanup_temp_images, download_remote_image
 
@@ -104,24 +104,17 @@ class XianyuPublisher:
             "--start-maximized",
         ]
 
-        chromium_path = get_chromium_executable_path()
-
         launch_kwargs = dict(
+            channel='chrome',
             headless=headless,
             args=browser_args,
             ignore_default_args=["--enable-automation"],
         )
-        if chromium_path:
-            launch_kwargs["executable_path"] = chromium_path
 
         self.browser = await self.playwright.chromium.launch(**launch_kwargs)
 
         self.context = await self.browser.new_context(
             viewport={"width": 1920, "height": 1080},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
             permissions=["geolocation", "notifications"],
             java_script_enabled=True,
             locale="zh-CN",

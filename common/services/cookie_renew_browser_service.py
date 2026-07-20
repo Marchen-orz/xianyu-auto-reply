@@ -38,7 +38,7 @@ from common.utils.xianyu_utils import trans_cookies
 from common.utils.browser_utils import ensure_playwright_browser_path, get_chromium_executable_path
 
 try:
-    from playwright.sync_api import sync_playwright
+    from patchright.sync_api import sync_playwright
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     sync_playwright = None
@@ -420,24 +420,16 @@ class CookieRenewBrowserService:
 
             # 构建持久化上下文启动参数
             launch_kwargs: dict[str, Any] = {
+                "channel": "chrome",
                 "headless": False,
                 "args": self.BROWSER_ARGS,
                 "viewport": {"width": 1280, "height": 720},
-                "user_agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/146.0.0.0 Safari/537.36"
-                ),
                 "locale": "zh-CN",
                 "timezone_id": "Asia/Shanghai",
             }
             # Docker环境下强制无头模式（容器内无显示器）
             if os.environ.get("BROWSER_HEADLESS", "").lower() == "true":
                 launch_kwargs["headless"] = True
-
-            chromium_path = get_chromium_executable_path()
-            if chromium_path:
-                launch_kwargs["executable_path"] = chromium_path
 
             # 启动前清理可能残留的 Singleton 锁文件（已持有账号锁，清理是安全的）
             self._clean_singleton_lock_files(user_data_dir, log_prefix)

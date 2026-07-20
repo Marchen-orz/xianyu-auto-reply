@@ -223,6 +223,13 @@ if errorlevel 1 (
     goto :end
 )
 
+echo [INFO] Installing Patchright Chrome into package dir...
+python -m patchright install chrome
+if errorlevel 1 (
+    echo [ERROR] Failed to bundle Patchright Chrome browser.
+    goto :end
+)
+
 REM --- Clean temp files from copies ---
 if exist "%DIST_DIR%\backend-web\logs" rmdir /s /q "%DIST_DIR%\backend-web\logs"
 if exist "%DIST_DIR%\websocket\logs" rmdir /s /q "%DIST_DIR%\websocket\logs"

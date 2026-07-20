@@ -31,6 +31,7 @@ open('/tmp/requirements.txt','w').write('\n'.join(deps))" && \
 
 # 安装Playwright浏览器
 RUN python -m playwright install --with-deps chromium
+RUN python -m patchright install chrome
 
 # 创建日志目录
 RUN mkdir -p /app/scheduler/logs

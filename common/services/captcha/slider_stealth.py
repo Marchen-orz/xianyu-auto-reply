@@ -35,7 +35,7 @@ from common.services.captcha.history_manager import HistoryManager
 from common.utils.browser_utils import ensure_playwright_browser_path, get_chromium_executable_path, is_frozen
 
 try:
-    from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext, ElementHandle
+    from patchright.sync_api import sync_playwright, Page, Browser, BrowserContext, ElementHandle
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
@@ -426,29 +426,19 @@ class PlaywrightSliderService:
                     'extra_http_headers': {'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'},
                 }
             else:
-                # ── 默认模式：原有 Playwright Chromium 环境 ──
-                browser_features = get_random_browser_features()
-                args = self.BROWSER_ARGS.copy()
-                args.append(f"--window-size={browser_features['window_size']}")
-                args.append(f"--lang={browser_features['lang']}")
-                args.append(f"--accept-lang={browser_features['accept_lang']}")
-
+                # ── 默认模式：干净环境（精简 args + 真 Chrome + no_viewport），与真实鼠标/真人轨迹引擎同款 ──
+                # 旧的大 BROWSER_ARGS + 伪造 UA + 合成轨迹已被 baxia 识别，改用 real_mouse 同款干净环境。
                 launch_kwargs = {
+                    'channel': 'chrome',        # 本机真实 Chrome（自然指纹）
                     'headless': self.headless,
-                    'args': args,
-                    'viewport': {'width': 1980, 'height': 1024},
-                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+                    'args': _HUMAN_TRAIL_BROWSER_ARGS,  # 精简 11 个 args，不再用大 BROWSER_ARGS
+                    'no_viewport': True,        # 保留真实窗口尺寸（与真实鼠标引擎一致）
                     'locale': 'zh-CN',
-                    'accept_downloads': True,
+                    'timezone_id': 'Asia/Shanghai',
                     'ignore_https_errors': True,
-                    'extra_http_headers': {
-                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
-                    }
+                    'extra_http_headers': {'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'},
                 }
-                executable_path = self._find_browser_executable()
-                if executable_path:
-                    launch_kwargs['executable_path'] = executable_path
-                    logger.info(f"【{self.pure_user_id}】使用 Chromium 可执行文件: {executable_path}")
+                logger.info(f"【{self.pure_user_id}】默认模式：干净环境（channel=chrome, 精简args）+ 合成轨迹")
 
             # 启动前清理可能残留的 Singleton 锁文件（已持有账号锁，清理是安全的）
             self._clean_singleton_lock_files()
@@ -1159,7 +1149,7 @@ class PlaywrightSliderService:
             是否执行成功
         """
         try:
-            # 真人轨迹回放模式
+            # 真人轨迹回放模式（仅 CAPTCHA_HUMAN_TRAIL=true 时）；默认模式用合成轨迹 + 干净环境
             if self._human_trail_mode:
                 return self._simulate_slide_human_trail(slider_button)
 

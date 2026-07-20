@@ -26,7 +26,7 @@ from common.utils.browser_utils import ensure_playwright_browser_path, get_chrom
 from common.services.captcha.concurrency import run_browser_task
 
 try:
-    from playwright.sync_api import sync_playwright
+    from patchright.sync_api import sync_playwright
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     sync_playwright = None
@@ -133,17 +133,14 @@ class CookiesRefreshService:
             logger.info(f"【COOKIES续期】账号 {account.account_id} Playwright启动成功")
 
             launch_kwargs: dict[str, Any] = {
+                "channel": "chrome",
                 "headless": True,
                 "args": self.BROWSER_ARGS,
             }
-            chromium_path = get_chromium_executable_path()
-            if chromium_path:
-                launch_kwargs["executable_path"] = chromium_path
 
             browser = playwright.chromium.launch(**launch_kwargs)
             context = browser.new_context(
                 viewport={"width": 1280, "height": 720},
-                user_agent=self.USER_AGENT,
                 locale="zh-CN",
                 timezone_id="Asia/Shanghai",
             )

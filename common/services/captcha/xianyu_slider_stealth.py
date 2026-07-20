@@ -15,7 +15,7 @@ from common.services.captcha.slider_stealth import PlaywrightSliderService
 from common.utils.time_utils import get_beijing_now_naive
 
 try:
-    from playwright.sync_api import sync_playwright, Page
+    from patchright.sync_api import sync_playwright, Page
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False

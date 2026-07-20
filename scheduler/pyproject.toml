@@ -25,6 +25,7 @@ dependencies = [
     "certifi>=2023.11.0",
     "python-dateutil>=2.8.0",
     "playwright",
+    "patchright",
     "Pillow>=10.0.0",
 ]
 

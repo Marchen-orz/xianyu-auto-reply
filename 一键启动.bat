@@ -140,5 +140,12 @@ if errorlevel 1 (
   exit /b 1
 )
 
+.venv\Scripts\python.exe -m patchright install chrome
+if errorlevel 1 (
+  popd
+  echo [error] patchright chrome install failed: %SERVICE_DIR%
+  exit /b 1
+)
+
 popd
 exit /b 0
