@@ -60,7 +60,7 @@ _xvfb_process = None
 
 
 def _is_xvfb_running(display: str = ":99") -> bool:
-    """检查指定 display 的 Xvfb 是否已在运行。"""
+    """检查指定 display 的 X 服务是否已在运行（Xvfb 或宿主机 X11 均可）。"""
     import subprocess
     try:
         result = subprocess.run(
@@ -73,20 +73,24 @@ def _is_xvfb_running(display: str = ":99") -> bool:
 
 
 def _ensure_xvfb() -> bool:
-    """确保 Xvfb 虚拟显示屏可用。已运行则复用，否则启动新的。
+    """确保有头浏览器可用的 DISPLAY 环境。
+
+    优先级：
+    1. 已有 DISPLAY 环境变量且可连接（宿主机 X11 挂进 Docker / VNC 等）
+    2. 容器内启动 Xvfb 虚拟显示屏
 
     Returns:
         True 表示 DISPLAY 已就绪，False 表示无法启动（应回退无头模式）。
     """
     global _xvfb_process
 
-    # 优先使用已有的 DISPLAY 环境变量（Docker compose / systemd 已配好）
+    # 1) 已有 DISPLAY 且可连接 → 直接复用（覆盖宿主机 X11 挂载和 VNC 两种场景）
     existing_display = os.environ.get("DISPLAY", "")
     if existing_display and _is_xvfb_running(existing_display):
-        logger.info(f"🖥️ 虚拟显示屏已就绪: DISPLAY={existing_display}")
+        logger.info(f"🖥️ 显示环境已就绪: DISPLAY={existing_display}")
         return True
 
-    # 尝试启动 Xvfb :99
+    # 2) 容器内启动 Xvfb 虚拟显示屏
     display = ":99"
     import subprocess
     try:
@@ -107,7 +111,7 @@ def _ensure_xvfb() -> bool:
         time.sleep(0.2)
         if _is_xvfb_running(display):
             os.environ["DISPLAY"] = display
-            logger.info(f"🖥️ 虚拟显示屏已启动: DISPLAY={display}")
+            logger.info(f"🖥️ Xvfb 虚拟显示屏已启动: DISPLAY={display}")
             return True
 
     # 启动了但 xdpyinfo 验证不过，仍然设置 DISPLAY 让浏览器尝试
