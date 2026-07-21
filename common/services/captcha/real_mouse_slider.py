@@ -126,7 +126,6 @@ _CAP_JS = r"""
 
 _BROWSER_ARGS = [
     "--no-sandbox",
-    "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
     "--disable-blink-features=AutomationControlled",
     "--disable-infobars",

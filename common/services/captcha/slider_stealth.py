@@ -83,7 +83,6 @@ _HUMAN_TRAIL_BROWSER_DIR = os.path.abspath(
 # 真人轨迹模式专用的精简浏览器参数（复刻 real_mouse_slider.py 的 _BROWSER_ARGS）
 _HUMAN_TRAIL_BROWSER_ARGS = [
     "--no-sandbox",
-    "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
     "--disable-blink-features=AutomationControlled",
     "--disable-infobars",
@@ -199,7 +198,6 @@ class PlaywrightSliderService:
     # 浏览器启动参数
     BROWSER_ARGS = [
         "--no-sandbox",
-        "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-accelerated-2d-canvas",
         "--no-first-run",

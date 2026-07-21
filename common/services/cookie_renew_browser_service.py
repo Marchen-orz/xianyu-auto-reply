@@ -115,7 +115,6 @@ class CookieRenewBrowserService:
     # 浏览器启动参数
     BROWSER_ARGS = [
         "--no-sandbox",
-        "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
         "--disable-web-security",

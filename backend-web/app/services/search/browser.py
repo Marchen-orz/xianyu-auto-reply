@@ -46,7 +46,6 @@ class BrowserManager:
     # 浏览器启动参数
     DEFAULT_BROWSER_ARGS = [
         '--no-sandbox',
-        '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--no-first-run',
         '--disable-extensions',

@@ -63,7 +63,6 @@ class CookiesRefreshService:
         "--disable-blink-features=AutomationControlled",
         "--disable-dev-shm-usage",
         "--no-sandbox",
-        "--disable-setuid-sandbox",
         "--lang=zh-CN",
     ]
     COOKIE_DOMAINS = [".goofish.com", ".taobao.com", ".alipay.com"]

@@ -16,13 +16,109 @@ import base64
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Optional
 
 from loguru import logger
-from patchright.async_api import Browser, BrowserContext, Page, async_playwright
-from common.utils.browser_utils import ensure_playwright_browser_path, get_chromium_executable_path
+from patchright.async_api import BrowserContext, Page, async_playwright
+from common.utils.browser_utils import ensure_playwright_browser_path
 from common.services.publish_image_service import cleanup_temp_images, download_remote_image
+
+# ── 与滑块验证码一致的干净环境参数 ─────────────────────────────────────────
+_PUBLISH_BROWSER_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-infobars",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-popup-blocking",
+    "--force-color-profile=srgb",
+    "--lang=zh-CN",
+    "--start-maximized",
+]
+
+_STEALTH_MINIMAL = """
+try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true }); } catch (e) {}
+try { delete Object.getPrototypeOf(navigator).webdriver; } catch (e) {}
+try { delete window.__playwright; delete window.__pw_manual; delete window.__PW_inspect; } catch (e) {}
+"""
+
+_CAL_JS = r"""
+(() => {
+  if (window.__cal) return;
+  window.__cal = [];
+  document.addEventListener('mousemove', e => {
+    window.__cal.push([e.clientX, e.clientY, e.screenX, e.screenY, e.timeStamp, e.buttons]);
+  }, true);
+})();
+"""
+
+# ── Xvfb 虚拟显示屏管理（Linux 有头浏览器） ──────────────────────────────────
+_xvfb_process = None
+
+
+def _is_xvfb_running(display: str = ":99") -> bool:
+    """检查指定 display 的 Xvfb 是否已在运行。"""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["xdpyinfo", "-display", display],
+            capture_output=True, timeout=3,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, Exception):
+        return False
+
+
+def _ensure_xvfb() -> bool:
+    """确保 Xvfb 虚拟显示屏可用。已运行则复用，否则启动新的。
+
+    Returns:
+        True 表示 DISPLAY 已就绪，False 表示无法启动（应回退无头模式）。
+    """
+    global _xvfb_process
+
+    # 优先使用已有的 DISPLAY 环境变量（Docker compose / systemd 已配好）
+    existing_display = os.environ.get("DISPLAY", "")
+    if existing_display and _is_xvfb_running(existing_display):
+        logger.info(f"🖥️ 虚拟显示屏已就绪: DISPLAY={existing_display}")
+        return True
+
+    # 尝试启动 Xvfb :99
+    display = ":99"
+    import subprocess
+    try:
+        _xvfb_process = subprocess.Popen(
+            ["Xvfb", display, "-screen", "0", "1920x1080x24", "-ac"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        logger.warning("Xvfb 未安装，回退无头模式（安装: apt install xvfb）")
+        return False
+    except Exception as e:
+        logger.warning(f"启动 Xvfb 失败: {e}，回退无头模式")
+        return False
+
+    # 等待 Xvfb 就绪
+    import time
+    for _ in range(10):
+        time.sleep(0.2)
+        if _is_xvfb_running(display):
+            os.environ["DISPLAY"] = display
+            logger.info(f"🖥️ 虚拟显示屏已启动: DISPLAY={display}")
+            return True
+
+    # 启动了但 xdpyinfo 验证不过，仍然设置 DISPLAY 让浏览器尝试
+    if _xvfb_process.poll() is None:
+        os.environ["DISPLAY"] = display
+        logger.info(f"🖥️ Xvfb 已启动（xdpyinfo 未验证，DISPLAY={display}）")
+        return True
+
+    logger.warning(f"Xvfb 启动后异常退出 (rc={_xvfb_process.returncode})，回退无头模式")
+    _xvfb_process = None
+    return False
 
 
 class XianyuPublisher:
@@ -39,7 +135,6 @@ class XianyuPublisher:
     """
 
     def __init__(self, static_root: str | Path | None = None):
-        self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.playwright = None
@@ -47,6 +142,7 @@ class XianyuPublisher:
         self.current_cookie: Optional[str] = None
         self.temp_image_paths: list[str] = []
         self.static_root = Path(static_root) if static_root else None
+        self._user_data_dir: Optional[str] = None
 
     async def _resolve_upload_image_path(self, image_path: str) -> str:
         if re.match(r"^https?://", image_path, re.IGNORECASE):
@@ -71,9 +167,29 @@ class XianyuPublisher:
         cleanup_temp_images(self.temp_image_paths)
         self.temp_image_paths = []
 
+    def _clean_singleton_lock_files(self) -> None:
+        """清理 user_data_dir 中残留的 Chrome Singleton 锁文件。"""
+        if not self._user_data_dir or not os.path.isdir(self._user_data_dir):
+            return
+        for fname in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            fpath = os.path.join(self._user_data_dir, fname)
+            exists = os.path.exists(fpath) or os.path.islink(fpath)
+            if not exists:
+                continue
+            try:
+                if os.path.islink(fpath):
+                    os.unlink(fpath)
+                else:
+                    os.remove(fpath)
+            except Exception:
+                pass
+
     async def initialize(self, headless: bool = True, force_reinit: bool = False):
-        """初始化浏览器（增强反检测）
-        
+        """初始化浏览器（对齐滑块验证码干净环境）
+
+        每次初始化使用空白持久化目录 + 注入 Cookie，与滑块验证码使用完全相同的
+        浏览器指纹：channel='chrome'、精简 args、no_viewport、最小 stealth。
+
         Args:
             headless: 是否使用无头模式
             force_reinit: 是否强制重新初始化（即使已经初始化）
@@ -87,55 +203,55 @@ class XianyuPublisher:
             logger.info("检测到BROWSER_HEADLESS=true，强制使用无头模式")
             headless = True
 
-        if self.is_initialized and force_reinit:
+        # Linux 下有头浏览器需要虚拟显示屏（Xvfb）
+        if not headless and sys.platform == "linux":
+            display = os.environ.get("DISPLAY", "")
+            if display:
+                logger.info(f"🖥️ 检测到已有 DISPLAY={display}，直接使用")
+            else:
+                headless = not _ensure_xvfb()
+
+        if self.is_initialized:
             await self.close_only_browser()
 
         ensure_playwright_browser_path()
-        self.playwright = await async_playwright().start()
+        if not self.playwright:
+            self.playwright = await async_playwright().start()
 
-        browser_args = [
-            "--disable-blink-features=AutomationControlled",
-            "--disable-dev-shm-usage",
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-web-security",
-            "--disable-features=IsolateOrigins,site-per-process",
-            "--window-size=1920,1080",
-            "--start-maximized",
-        ]
+        # 每次用空白临时目录，不复用旧 profile 状态
+        import tempfile
+        self._user_data_dir = tempfile.mkdtemp(prefix="publish_")
+        self._clean_singleton_lock_files()
 
-        launch_kwargs = dict(
+        # 与滑块验证码完全一致的 launch_persistent_context 参数
+        self.context = await self.playwright.chromium.launch_persistent_context(
+            self._user_data_dir,
             channel='chrome',
             headless=headless,
-            args=browser_args,
+            args=_PUBLISH_BROWSER_ARGS,
             ignore_default_args=["--enable-automation"],
+            no_viewport=True,
+            locale='zh-CN',
+            timezone_id='Asia/Shanghai',
+            ignore_https_errors=True,
+            extra_http_headers={'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'},
         )
 
-        self.browser = await self.playwright.chromium.launch(**launch_kwargs)
+        # context 级 init script：每个新 page 自动生效
+        await self.context.add_init_script(_STEALTH_MINIMAL)
+        await self.context.add_init_script(_CAL_JS)
 
-        self.context = await self.browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            permissions=["geolocation", "notifications"],
-            java_script_enabled=True,
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-        )
-
-        self.page = await self.context.new_page()
-
-        # 注入 JS 隐藏自动化标识
-        await self.page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-            window.chrome = { runtime: {} };
-        """)
-
+        # 复用 launch_persistent_context 自动打开的页面
+        # （有头模式下关闭自动页面再 new_page 会报 Failed to open a new tab）
+        if self.context.pages:
+            self.page = self.context.pages[0]
+        else:
+            self.page = await self.context.new_page()
         self.page.set_default_timeout(30000)
         self.page.set_default_navigation_timeout(60000)
         self.is_initialized = True
 
-        logger.info("✅ 浏览器初始化成功（已启用反检测）")
+        logger.info("✅ 浏览器初始化成功（干净环境，对齐滑块验证码）")
 
     async def set_cookies(self, cookies_str: str):
         """向浏览器注入闲鱼登录 Cookie
@@ -171,8 +287,12 @@ class XianyuPublisher:
         if not self.is_initialized or not self.context:
             raise Exception("浏览器未初始化")
 
-        if self.page:
-            await self.page.close()
+        # 关闭所有旧页面，创建干净新页面
+        for existing_page in list(self.context.pages):
+            try:
+                await existing_page.close()
+            except Exception:
+                pass
 
         self.page = await self.context.new_page()
         self.page.set_default_timeout(30000)
@@ -202,19 +322,15 @@ class XianyuPublisher:
             logger.info(f"商品信息: {item_data.get('description', '')[:50]}...")
             logger.info(f"浏览器复用模式: {reuse_browser}")
 
-            headless = True
-            logger.info("🖥️ 使用无头模式（浏览器不可见）")
+            headless = False
+            logger.info("🖥️ 使用有头模式（浏览器可见）")
 
             if reuse_browser and self.is_initialized and self.current_cookie == cookie_data["cookie"]:
                 logger.info("🔄 复用现有浏览器，重新创建页面...")
                 await self.reinitialize_page()
             else:
                 await self.initialize(headless=headless)
-
-            if not (reuse_browser and self.is_initialized and self.current_cookie == cookie_data["cookie"]):
                 await self.set_cookies(cookie_data["cookie"])
-
-            await self.set_cookies(cookie_data["cookie"])
 
             logger.info("\n[步骤1] 🌐 先访问闲鱼首页，触发Cookie初始化...")
             await self.page.goto("https://www.goofish.com", wait_until="networkidle", timeout=30000)
@@ -1816,6 +1932,17 @@ class XianyuPublisher:
             result["message"] = '未找到发布按钮'
             logger.error("❌ 未找到发布按钮")
 
+    def _cleanup_user_data_dir(self):
+        """清理临时持久化目录。"""
+        if not self._user_data_dir:
+            return
+        try:
+            import shutil
+            shutil.rmtree(self._user_data_dir, ignore_errors=True)
+        except Exception:
+            pass
+        self._user_data_dir = None
+
     async def close_only_browser(self):
         """只关闭浏览器，不停止playwright"""
         try:
@@ -1825,13 +1952,13 @@ class XianyuPublisher:
             if self.context:
                 await self.context.close()
                 self.context = None
-            if self.browser:
-                await self.browser.close()
-                self.browser = None
+            self.is_initialized = False
+            self.current_cookie = None
             logger.info("✅ 浏览器已关闭（保持playwright运行）")
         except Exception as e:
             logger.error(f"关闭浏览器时出错: {e}")
         finally:
+            self._cleanup_user_data_dir()
             self._cleanup_temp_images()
 
     async def close(self):
@@ -1839,18 +1966,20 @@ class XianyuPublisher:
         try:
             if self.page:
                 await self.page.close()
+                self.page = None
             if self.context:
                 await self.context.close()
-            if self.browser:
-                await self.browser.close()
+                self.context = None
             if self.playwright:
                 await self.playwright.stop()
+                self.playwright = None
             self.is_initialized = False
             self.current_cookie = None
             logger.info("✅ 浏览器和playwright已关闭")
         except Exception as e:
             logger.error(f"关闭浏览器时出错: {e}")
         finally:
+            self._cleanup_user_data_dir()
             self._cleanup_temp_images()
 
     async def __aenter__(self):

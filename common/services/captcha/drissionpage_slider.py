@@ -162,7 +162,6 @@ class DrissionPageSliderService:
 
         for arg in (
             "--no-sandbox",
-            "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
             "--disable-web-security",
