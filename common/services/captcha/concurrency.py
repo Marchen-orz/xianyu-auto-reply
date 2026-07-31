@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -289,7 +290,7 @@ class BrowserSlotManager:
         """延迟加载配置"""
         if self._config_loaded:
             return
-        
+
         try:
             # 尝试从不同服务获取配置
             settings = None
@@ -307,10 +308,15 @@ class BrowserSlotManager:
                     pass
             
             if settings:
-                # 使用getattr安全获取配置，避免属性不存在的错误
-                self._max_slots = getattr(settings, 'max_captcha_concurrent', 1)
-                self._wait_timeout = getattr(settings, 'captcha_wait_timeout', 120)
-                logger.info(f"浏览器槽位配置: 最大并发={self._max_slots}, 超时={self._wait_timeout}秒")
+                configured_slots = max(1, int(getattr(settings, 'max_captcha_concurrent', 1) or 1))
+                self._wait_timeout = max(1, int(getattr(settings, 'captcha_wait_timeout', 120) or 120))
+                human_trail = os.environ.get("CAPTCHA_HUMAN_TRAIL", "").lower() in ("true", "1", "yes")
+                # 真人轨迹回放共用 real_mouse_shared profile 和同一 noVNC 屏幕，必须串行。
+                self._max_slots = 1 if human_trail else configured_slots
+                logger.info(
+                    f"浏览器槽位配置: 配置并发={configured_slots}, 有效并发={self._max_slots}, "
+                    f"超时={self._wait_timeout}秒, 真人轨迹模式={human_trail}"
+                )
             else:
                 logger.warning("无法获取配置，使用默认值")
                 self._max_slots = 1

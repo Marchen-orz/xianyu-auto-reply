@@ -16,6 +16,7 @@ from loguru import logger
 
 from common.services.captcha.slider_stealth import run_slider_verification, CAPTCHA_NOT_REQUIRED, URL_EXPIRED
 from common.services.captcha.remote_timeout import get_remote_solve_timeout
+from common.core.config import get_settings as get_common_settings
 from common.services.captcha.drissionpage_slider import (
     run_drissionpage_verification,
     DRISSIONPAGE_AVAILABLE,
@@ -298,9 +299,18 @@ def run_slider_verification_with_fallback(
             )
 
     # 1. Playwright 主引擎
-    #    真人轨迹回放模式需要更长的超时（浏览器启动+导航+多次重试换轨迹）
+    #    真人轨迹回放模式需要保留足够的 noVNC 观察/人工操作窗口。
     if _is_human_trail_enabled():
-        browser_timeout = max(browser_timeout, 60)
+        try:
+            configured_timeout = int(get_common_settings().captcha_human_trail_timeout)
+        except Exception:
+            configured_timeout = 180
+        configured_timeout = max(60, configured_timeout)
+        browser_timeout = max(browser_timeout, configured_timeout)
+        logger.info(
+            f"【{user_id}】真人轨迹回放模式已启用: 浏览器超时={browser_timeout}秒，"
+            "DrissionPage 兜底将跳过"
+        )
     ok, cookies = run_slider_verification(
         user_id, url, enable_learning, headless, browser_timeout,
         url_provider=url_provider,

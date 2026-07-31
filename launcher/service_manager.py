@@ -187,6 +187,9 @@ class ServiceManager:
         # 数据库备份目录：backend-web 与 scheduler 必须指向同一绝对路径，
         # 否则 scheduler 写入的备份文件 backend-web 无法读取下载（本地源码模式各服务 cwd 不同）
         backup_dir = (self.project_root / "backups").as_posix()
+        # 静态文件目录：backend-web / websocket / scheduler 必须指向同一绝对路径，
+        # 否则 source 模式下不同服务会把 STATIC_DIR=static 解析到各自 cwd，导致图片文件互相不可见。
+        static_dir = (self.project_root / "xianyu_auto_reply" / "static").as_posix()
 
         # backend-web .env
         backend_env = (
@@ -208,12 +211,15 @@ class ServiceManager:
             f"CORS_ORIGINS=*\n"
             f"WEBSOCKET_SERVICE_URL=http://127.0.0.1:8090\n"
             f"SCHEDULER_SERVICE_URL=http://127.0.0.1:8091\n"
-            f"STATIC_DIR=static\n"
+            f"STATIC_DIR={static_dir}\n"
             f"BACKUP_DIR={backup_dir}\n"
             f"FRONTEND_PUBLIC_URL=http://127.0.0.1:9000\n"
             f"BACKEND_WEB_PUBLIC_URL=http://127.0.0.1:8089\n"
+            f"PUBLISH_REMOTE_CDP_ENABLED=true\n"
+            f"PUBLISH_REMOTE_CDP_URL=http://127.0.0.1:9223\n"
+            f"PUBLISH_REMOTE_CDP_FALLBACK_TO_LOCAL=false\n"
         )
-        
+
         # websocket .env
         websocket_env = (
             f"ENVIRONMENT=production\n"
@@ -230,13 +236,16 @@ class ServiceManager:
             f"WEBSOCKET_PORT=8090\n"
             f"MAX_CAPTCHA_CONCURRENT=1\n"
             f"BROWSER_HEADLESS={str(config.get('browser_headless', True)).lower()}\n"
+            f"CAPTCHA_REMOTE_CDP_ENABLED=true\n"
+            f"CAPTCHA_REMOTE_CDP_URL=http://127.0.0.1:9223\n"
+            f"CAPTCHA_REMOTE_CDP_FALLBACK_TO_LOCAL=false\n"
             f"CAPTCHA_DRISSIONPAGE_HEADLESS={str(config.get('captcha_drissionpage_headless', True)).lower()}\n"
             f"TOKEN_REFRESH_INTERVAL=72000\n"
             f"TOKEN_RETRY_INTERVAL=7200\n"
             f"BACKEND_WEB_SERVICE_URL=http://127.0.0.1:8089\n"
-            f"STATIC_DIR=static\n"
+            f"STATIC_DIR={static_dir}\n"
         )
-        
+
         # scheduler .env
         scheduler_env = (
             f"ENVIRONMENT=production\n"
@@ -255,7 +264,7 @@ class ServiceManager:
             f"RATE_INTERVAL=20\n"
             f"WEBSOCKET_SERVICE_URL=http://127.0.0.1:8090\n"
             f"BACKEND_WEB_SERVICE_URL=http://127.0.0.1:8089\n"
-            f"STATIC_DIR=static\n"
+            f"STATIC_DIR={static_dir}\n"
             f"BACKUP_DIR={backup_dir}\n"
         )
         

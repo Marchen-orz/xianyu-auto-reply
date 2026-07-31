@@ -103,6 +103,12 @@ class BaseConfig(BaseSettings):
     #         加载真人录制轨迹用 CDP page.mouse 回放；跳过 DrissionPage 兜底。
     # 适用于想用真人轨迹但无物理桌面的环境（Linux/Xvfb 等）。
     captcha_human_trail_enabled: bool = Field(default=False, alias="CAPTCHA_HUMAN_TRAIL")
+    captcha_human_trail_timeout: int = Field(default=180, alias="CAPTCHA_HUMAN_TRAIL_TIMEOUT")
+
+    # 滑块浏览器并发/排队配置。放在共享配置中，确保 BrowserSlotManager 不会
+    # 因先加载 common 配置而忽略 websocket 的 MAX_CAPTCHA_CONCURRENT。
+    max_captcha_concurrent: int = Field(default=3, alias="MAX_CAPTCHA_CONCURRENT")
+    captcha_wait_timeout: int = Field(default=120, alias="CAPTCHA_WAIT_TIMEOUT")
 
     @property
     def database_url(self) -> str:

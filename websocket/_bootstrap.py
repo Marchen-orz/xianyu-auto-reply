@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import faulthandler
+import os
+import subprocess
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -30,6 +33,103 @@ from common.utils.network_utils import resolve_listen_host
 faulthandler.enable()
 
 settings = get_settings()
+
+_CAPTCHA_DISPLAY = os.environ.get("CAPTCHA_DISPLAY", ":100")
+_captcha_xvfb_process: subprocess.Popen | None = None
+_captcha_xvfb_started_here = False
+
+
+def _captcha_remote_cdp_enabled() -> bool:
+    """共享宿主 Chrome 时不再创建容器内隐藏显示屏。"""
+    value = os.environ.get("CAPTCHA_REMOTE_CDP_ENABLED", "").strip().lower()
+    if value in ("true", "1", "yes"):
+        return True
+    if value in ("false", "0", "no"):
+        return False
+    return bool(
+        os.environ.get("CAPTCHA_REMOTE_CDP_URL")
+        or os.environ.get("PUBLISH_REMOTE_CDP_URL")
+    )
+
+
+def _display_ready(display: str) -> bool:
+    """检查 X display 是否已可连接。"""
+    try:
+        result = subprocess.run(
+            ["xdpyinfo", "-display", display],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return False
+
+
+def _remove_stale_captcha_display_files() -> None:
+    """仅在 :100 不可连接时清理其孤儿锁和 socket。"""
+    display_number = _CAPTCHA_DISPLAY.removeprefix(":").split(".", 1)[0]
+    for path in (
+        Path(f"/tmp/.X{display_number}-lock"),
+        Path(f"/tmp/.X11-unix/X{display_number}"),
+    ):
+        try:
+            if path.exists() or path.is_symlink():
+                path.unlink()
+                logger.warning(f"已清理验证码隐藏显示屏残留文件: {path}")
+        except OSError as e:
+            logger.warning(f"清理验证码隐藏显示屏残留文件失败: {path}, {e}")
+
+
+def _ensure_captcha_xvfb() -> bool:
+    """启动 websocket 容器内专用隐藏 Xvfb，不占用宿主 noVNC 的 :99。"""
+    global _captcha_xvfb_process, _captcha_xvfb_started_here
+
+    if _display_ready(_CAPTCHA_DISPLAY):
+        os.environ["CAPTCHA_DISPLAY"] = _CAPTCHA_DISPLAY
+        logger.info(f"验证码隐藏显示屏已就绪: DISPLAY={_CAPTCHA_DISPLAY}")
+        return True
+
+    _remove_stale_captcha_display_files()
+    try:
+        _captcha_xvfb_process = subprocess.Popen(
+            ["Xvfb", _CAPTCHA_DISPLAY, "-screen", "0", "1920x1080x24", "-ac"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _captcha_xvfb_started_here = True
+    except (FileNotFoundError, OSError) as e:
+        logger.error(f"启动验证码隐藏显示屏失败: {e}")
+        return False
+
+    for _ in range(20):
+        time.sleep(0.2)
+        if _display_ready(_CAPTCHA_DISPLAY):
+            os.environ["CAPTCHA_DISPLAY"] = _CAPTCHA_DISPLAY
+            logger.info(f"验证码隐藏显示屏已启动: DISPLAY={_CAPTCHA_DISPLAY}")
+            return True
+
+    logger.error(f"验证码隐藏显示屏启动后不可用: DISPLAY={_CAPTCHA_DISPLAY}")
+    _stop_captcha_xvfb()
+    return False
+
+
+def _stop_captcha_xvfb() -> None:
+    """停止本 websocket 进程创建的隐藏 Xvfb。"""
+    global _captcha_xvfb_process, _captcha_xvfb_started_here
+
+    if _captcha_xvfb_started_here and _captcha_xvfb_process is not None:
+        try:
+            _captcha_xvfb_process.terminate()
+            _captcha_xvfb_process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            _captcha_xvfb_process.kill()
+        except OSError:
+            pass
+    _captcha_xvfb_process = None
+    _captcha_xvfb_started_here = False
+    _remove_stale_captcha_display_files()
+
 
 # 配置日志（控制台 + 文件 + 第三方库拦截）
 setup_logging(
@@ -72,7 +172,16 @@ async def lifespan(app: FastAPI):
     if not await check_database_connection():
         logger.error("数据库连接失败，服务退出")
         sys.exit(1)
-    
+
+    if _captcha_remote_cdp_enabled():
+        cdp_url = (
+            os.environ.get("CAPTCHA_REMOTE_CDP_URL")
+            or os.environ.get("PUBLISH_REMOTE_CDP_URL")
+        )
+        logger.info(f"验证码使用宿主共享 Chrome/CDP（noVNC DISPLAY=:99）: {cdp_url}")
+    elif not _ensure_captcha_xvfb():
+        logger.error("验证码本地隐藏显示屏不可用；有头验证码会在启动时明确失败")
+
     # 从数据库加载日志保留天数配置
     from common.utils.logging_utils import apply_db_log_retention, run_db_log_retention_sync
     await apply_db_log_retention()
@@ -103,6 +212,10 @@ async def lifespan(app: FastAPI):
         logger.info("CookieManager已停止")
     except Exception as e:
         logger.error(f"CookieManager停止失败: {e}")
+
+    if _captcha_xvfb_started_here:
+        _stop_captcha_xvfb()
+        logger.info("验证码本地隐藏显示屏已停止")
 
     log_retention_sync_task.cancel()
     try:

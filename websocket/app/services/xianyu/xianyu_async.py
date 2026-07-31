@@ -2212,25 +2212,18 @@ class XianyuAsync:
                 logger.info(f"【{self.cookie_id}】使用已有的CDN图片链接: {image_url}")
                 need_get_size_from_url = True
             elif image_url.startswith('/static/uploads/') or image_url.startswith('static/uploads/'):
-                # 本地图片需要先上传到CDN
-                # 使用STATIC_DIR环境变量（Docker共享卷），本地回退到backend-web/static
-                _static_env = os.environ.get("STATIC_DIR", "")
-                if _static_env:
-                    static_root = Path(_static_env)
-                    if not static_root.is_absolute():
-                        static_root = Path.cwd() / static_root
-                else:
-                    static_root = Path(__file__).resolve().parent.parent.parent.parent.parent / "backend-web" / "static"
-                
-                relative_path = image_url.lstrip('/').replace('static/', '', 1)
-                local_image_path = str(static_root / relative_path)
-                
+                from common.utils.static_paths import get_static_root, resolve_static_url_to_path
+
+                resolved_path = resolve_static_url_to_path(image_url)
+                static_root = get_static_root()
+                local_image_path = str(resolved_path) if resolved_path else ""
+
                 logger.info(f"【{self.cookie_id}】静态文件根目录: {static_root}")
                 logger.info(f"【{self.cookie_id}】本地图片路径: {local_image_path}")
-                
-                if os.path.exists(local_image_path):
+
+                if resolved_path and resolved_path.exists():
                     logger.info(f"【{self.cookie_id}】准备上传本地图片到闲鱼CDN: {local_image_path}")
-                    
+
                     # 获取本地图片尺寸
                     try:
                         from PIL import Image
@@ -2239,13 +2232,13 @@ class XianyuAsync:
                             logger.info(f"【{self.cookie_id}】获取到本地图片尺寸: {width}x{height}")
                     except Exception as e:
                         logger.warning(f"【{self.cookie_id}】获取图片尺寸失败，使用默认尺寸: {e}")
-                    
+
                     from app.utils.image_uploader import ImageUploader
                     uploader = ImageUploader(self.cookies_str)
-                    
+
                     async with uploader:
                         cdn_url = await uploader.upload_image(local_image_path)
-                        
+
                     if not cdn_url:
                         logger.error(f"【{self.cookie_id}】图片上传到CDN失败")
                         return {
@@ -2254,9 +2247,9 @@ class XianyuAsync:
                             "image_url": image_url,
                             "error_message": "图片上传到CDN失败",
                         }
-                    
+
                     logger.info(f"【{self.cookie_id}】图片上传成功，CDN URL: {cdn_url}")
-                    
+
                     # 上传成功后更新卡券图片URL到数据库
                     if card_id:
                         try:
@@ -2271,7 +2264,7 @@ class XianyuAsync:
                                 logger.info(f"【{self.cookie_id}】已更新卡券 {card_id} 的图片URL为CDN地址")
                         except Exception as e:
                             logger.warning(f"【{self.cookie_id}】更新卡券图片URL失败: {e}")
-                    
+
                     # 上传成功后更新关键词图片URL到数据库
                     if keyword:
                         try:
@@ -2280,7 +2273,7 @@ class XianyuAsync:
                             logger.info(f"【{self.cookie_id}】已更新关键词 '{keyword}' 的图片URL为CDN地址")
                         except Exception as e:
                             logger.warning(f"【{self.cookie_id}】更新关键词图片URL失败: {e}")
-                    
+
                     # 上传成功后更新默认回复图片URL到数据库
                     # default_reply_item_id 不为 None 时才更新（空字符串表示账号级别）
                     if default_reply_item_id is not None:
@@ -2301,7 +2294,8 @@ class XianyuAsync:
                         "success": False,
                         "mode": "image",
                         "image_url": image_url,
-                        "error_message": "本地图片文件不存在",
+                        "error_message": f"本地图片文件不存在: {local_image_path} (STATIC_DIR={static_root})",
+                        "retryable": False,
                     }
             else:
                 # 其他外部链接，尝试直接使用，需要从URL获取尺寸

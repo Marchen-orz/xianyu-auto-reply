@@ -19,15 +19,65 @@ import re
 import sys
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 from loguru import logger
-from patchright.async_api import BrowserContext, Page, async_playwright
+from patchright.async_api import Browser, BrowserContext, Page, async_playwright
 from common.utils.browser_utils import ensure_playwright_browser_path
 from common.services.publish_image_service import cleanup_temp_images, download_remote_image
 
+
+def _publish_remote_cdp_url() -> str:
+    """读取宿主机共享 Chrome 的 CDP 地址。
+
+    优先 PUBLISH_REMOTE_CDP_URL，回退 CAPTCHA_REMOTE_CDP_URL（与验证码共用同一个宿主 Chrome）。
+    """
+    return (
+        os.environ.get("PUBLISH_REMOTE_CDP_URL")
+        or os.environ.get("CAPTCHA_REMOTE_CDP_URL")
+        or ""
+    )
+
+
+def _publish_remote_cdp_enabled() -> bool:
+    val = os.environ.get("PUBLISH_REMOTE_CDP_ENABLED", "").lower()
+    if val in ("true", "1", "yes"):
+        return True
+    # 未显式设置时，只要配了 CDP 地址就默认启用（复用宿主虚拟屏 Chrome）
+    if val == "false":
+        return False
+    return bool(_publish_remote_cdp_url())
+
+
+def _publish_remote_cdp_fallback() -> bool:
+    val = os.environ.get("PUBLISH_REMOTE_CDP_FALLBACK_TO_LOCAL", "").lower()
+    return val not in ("false", "0", "no")
+
+
+def _item_id_from_url(url: str) -> Optional[str]:
+    """仅按 URL path/query 判断商品详情页，避免 spm 中的 publish 造成误判。"""
+    try:
+        parsed = urlparse(url)
+        path = parsed.path.rstrip("/").lower()
+        if path != "/item":
+            return None
+        item_id = (parse_qs(parsed.query).get("id") or [""])[0]
+        return item_id if item_id.isdigit() else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_publish_page_url(url: str) -> bool:
+    """判断真正的发布页 path，不检查 query 中的 spm 等追踪参数。"""
+    try:
+        return urlparse(url).path.rstrip("/").lower() == "/publish"
+    except (TypeError, ValueError):
+        return False
+
 # ── 与滑块验证码一致的干净环境参数 ─────────────────────────────────────────
+# 注意：Playwright 默认已带 --no-sandbox，这里不再重复添加（重复虽无害，
+# 但 Chrome 150 在部分环境下会显示"不支持的标志"infobar）。
 _PUBLISH_BROWSER_ARGS = [
-    "--no-sandbox",
     "--disable-dev-shm-usage",
     "--disable-blink-features=AutomationControlled",
     "--disable-infobars",
@@ -37,6 +87,7 @@ _PUBLISH_BROWSER_ARGS = [
     "--force-color-profile=srgb",
     "--lang=zh-CN",
     "--start-maximized",
+    "--disable-features=ChromeWhatsNewUI",  # 禁止"新版 Chrome"提示弹窗
 ]
 
 _STEALTH_MINIMAL = """
@@ -54,6 +105,40 @@ _CAL_JS = r"""
   }, true);
 })();
 """
+
+
+async def _safe_page_screenshot(page: Page, *, full_page: bool = True, timeout_ms: int = 8000) -> bytes | None:
+    """尽量避免 screenshot 因等待字体加载而卡死。
+
+    Playwright 会在截图前等待 fonts.ready；当页面里有异常 webfont / 跨域字体 /
+    长时间 pending 的 font 请求时，screenshot 会卡在 "waiting for fonts to load"。
+    这里采用多级降级：
+    1. 正常截图（较短超时）
+    2. 关闭 full_page 再试
+    3. 临时禁用字体等待后再试 viewport 截图
+    失败时返回 None，不再让 screenshot 反向遮蔽真实错误。
+    """
+    attempts = [
+        {"full_page": full_page, "timeout": timeout_ms},
+        {"full_page": False, "timeout": min(timeout_ms, 5000)},
+    ]
+
+    for idx, opts in enumerate(attempts, 1):
+        try:
+            return await page.screenshot(**opts)
+        except Exception as e:
+            logger.warning(f"截图尝试 {idx} 失败: {e}")
+
+    try:
+        await page.add_style_tag(content="* { font-family: sans-serif !important; }")
+    except Exception:
+        pass
+
+    try:
+        return await page.screenshot(full_page=False, timeout=3000)
+    except Exception as e:
+        logger.error(f"截图最终失败，放弃截图: {e}")
+        return None
 
 # ── Xvfb 虚拟显示屏管理（Linux 有头浏览器） ──────────────────────────────────
 _xvfb_process = None
@@ -139,6 +224,7 @@ class XianyuPublisher:
     """
 
     def __init__(self, static_root: str | Path | None = None):
+        self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.playwright = None
@@ -147,6 +233,9 @@ class XianyuPublisher:
         self.temp_image_paths: list[str] = []
         self.static_root = Path(static_root) if static_root else None
         self._user_data_dir: Optional[str] = None
+        # 远程 CDP 模式：连接宿主机共享 Chrome，不再本地 launch，也不在 close() 时杀宿主 Chrome
+        self._remote_cdp_mode = False
+        self._cdp_context_owned = False
 
     async def _resolve_upload_image_path(self, image_path: str) -> str:
         if re.match(r"^https?://", image_path, re.IGNORECASE):
@@ -171,6 +260,59 @@ class XianyuPublisher:
         cleanup_temp_images(self.temp_image_paths)
         self.temp_image_paths = []
 
+    def _compress_image_for_upload(self, src_path: str) -> str:
+        """压缩图片到 500KB 以下，返回压缩后临时文件路径（JPEG）。
+
+        闲鱼发布页上传大图（>1MB）容易超时/卡住，统一压到 500KB 以下再传。
+        策略：JPEG + 逐步降质量，仍超则缩放尺寸。
+        """
+        try:
+            from PIL import Image
+            import io
+            import tempfile
+
+            img = Image.open(src_path)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+
+            target = 500 * 1024  # 500KB
+            scales = [1.0, 0.8, 0.6, 0.5, 0.4]
+            last_buf = None
+            for scale in scales:
+                w, h = img.size
+                if scale < 1.0:
+                    scaled = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+                else:
+                    scaled = img
+                for q in [85, 75, 65, 55, 45]:
+                    buf = io.BytesIO()
+                    scaled.save(buf, format="JPEG", quality=q)
+                    last_buf = buf
+                    if buf.tell() <= target:
+                        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+                        tmp.write(buf.getvalue())
+                        tmp.close()
+                        self.temp_image_paths.append(tmp.name)
+                        logger.info(
+                            f"📦 图片压缩: {os.path.basename(src_path)} -> "
+                            f"{len(buf.getvalue()) // 1024}KB (quality={q}, scale={scale})"
+                        )
+                        return tmp.name
+            # 全部方案都压不到 500KB，用最后一个最小结果
+            if last_buf is not None:
+                tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+                tmp.write(last_buf.getvalue())
+                tmp.close()
+                self.temp_image_paths.append(tmp.name)
+                logger.info(
+                    f"📦 图片压缩(未达标): {os.path.basename(src_path)} -> "
+                    f"{last_buf.tell() // 1024}KB"
+                )
+                return tmp.name
+        except Exception as e:
+            logger.warning(f"图片压缩失败，用原图: {e}")
+        return src_path
+
     def _clean_singleton_lock_files(self) -> None:
         """清理 user_data_dir 中残留的 Chrome Singleton 锁文件。"""
         if not self._user_data_dir or not os.path.isdir(self._user_data_dir):
@@ -191,17 +333,60 @@ class XianyuPublisher:
     async def initialize(self, headless: bool = True, force_reinit: bool = False):
         """初始化浏览器（对齐滑块验证码干净环境）
 
-        每次初始化使用空白持久化目录 + 注入 Cookie，与滑块验证码使用完全相同的
-        浏览器指纹：channel='chrome'、精简 args、no_viewport、最小 stealth。
+        优先连接宿主机共享 Chrome/CDP（与验证码同一个浏览器实例，画在 :99 虚拟屏上，
+        避免在同一个 DISPLAY 上再 launch 一个 Chrome 抢屏导致页面卡死）；
+        连接失败时回退本地 launch_persistent_context。
 
         Args:
-            headless: 是否使用无头模式
+            headless: 是否使用无头模式（仅本地回退路径生效）
             force_reinit: 是否强制重新初始化（即使已经初始化）
         """
         if self.is_initialized and not force_reinit:
             logger.info("✅ 浏览器已初始化，复用现有实例")
             return
 
+        if self.is_initialized:
+            await self.close_only_browser()
+
+        ensure_playwright_browser_path()
+        if not self.playwright:
+            self.playwright = await async_playwright().start()
+
+        # ── 优先：连接宿主机共享 Chrome/CDP ──
+        cdp_url = _publish_remote_cdp_url()
+        if _publish_remote_cdp_enabled() and cdp_url:
+            logger.info(f"【商品发布】优先连接远程 CDP 浏览器: {cdp_url}")
+            try:
+                self.browser = await self.playwright.chromium.connect_over_cdp(
+                    cdp_url, timeout=30000,
+                )
+                # 复用 Chrome 默认 context（与 noVNC 手动操作完全相同的环境），
+                # 不新建 incognito context——incognito 无缓存/历史，goofish 会触发更严
+                # 反爬导致图片资源加载不出来。
+                contexts = list(self.browser.contexts)
+                if not contexts:
+                    raise RuntimeError("宿主 Chrome 没有可复用的默认 context")
+                self.context = contexts[0]
+                self._cdp_context_owned = False
+                logger.info("【商品发布】复用宿主 Chrome 默认 context")
+                self._remote_cdp_mode = True
+                # 所有注入仅作用于发布器自己的页签，避免污染验证码和人工页签。
+                self.page = await self.context.new_page()
+                await self.page.add_init_script(_STEALTH_MINIMAL)
+                await self.page.add_init_script(_CAL_JS)
+                self.page.set_default_timeout(30000)
+                self.page.set_default_navigation_timeout(60000)
+                self.is_initialized = True
+                logger.info("✅ 浏览器初始化成功（远程 CDP 模式，复用宿主虚拟屏 Chrome）")
+                return
+            except Exception as cdp_error:
+                self._remote_cdp_mode = False
+                self._cdp_context_owned = False
+                if not _publish_remote_cdp_fallback():
+                    raise
+                logger.warning(f"【商品发布】连接远程 CDP 失败，回退本地 launch: {cdp_error}")
+
+        # ── 回退：本地 launch_persistent_context ──
         # Docker环境下强制无头模式（容器内无显示器，有头模式会报错）
         if not headless and os.environ.get("BROWSER_HEADLESS", "").lower() == "true":
             logger.info("检测到BROWSER_HEADLESS=true，强制使用无头模式")
@@ -214,13 +399,6 @@ class XianyuPublisher:
                 logger.info(f"🖥️ 检测到已有 DISPLAY={display}，直接使用")
             else:
                 headless = not _ensure_xvfb()
-
-        if self.is_initialized:
-            await self.close_only_browser()
-
-        ensure_playwright_browser_path()
-        if not self.playwright:
-            self.playwright = await async_playwright().start()
 
         # 每次用空白临时目录，不复用旧 profile 状态
         import tempfile
@@ -291,14 +469,17 @@ class XianyuPublisher:
         if not self.is_initialized or not self.context:
             raise Exception("浏览器未初始化")
 
-        # 关闭所有旧页面，创建干净新页面
-        for existing_page in list(self.context.pages):
+        # 只关闭发布器拥有的页签，不能影响同一 context 中的验证码或人工页签。
+        if self.page:
             try:
-                await existing_page.close()
+                await self.page.close()
             except Exception:
                 pass
 
         self.page = await self.context.new_page()
+        if self._remote_cdp_mode:
+            await self.page.add_init_script(_STEALTH_MINIMAL)
+            await self.page.add_init_script(_CAL_JS)
         self.page.set_default_timeout(30000)
         self.page.set_default_navigation_timeout(60000)
         logger.info("✅ 页面已重新创建（浏览器复用）")
@@ -337,7 +518,7 @@ class XianyuPublisher:
                 await self.set_cookies(cookie_data["cookie"])
 
             logger.info("\n[步骤1] 🌐 先访问闲鱼首页，触发Cookie初始化...")
-            await self.page.goto("https://www.goofish.com", wait_until="networkidle", timeout=30000)
+            await self.page.goto("https://www.goofish.com", wait_until="load", timeout=30000)
             await asyncio.sleep(1)
 
             logger.info("\n[步骤2] 🌐 访问登录页面...")
@@ -350,7 +531,7 @@ class XianyuPublisher:
 
             publish_url = "https://www.goofish.com/publish?spm=a21ybx.item.sidebar.1.297e3da6aDZAmV"
             logger.info(f"\n[步骤3] 🌐 访问发布页面: {publish_url}")
-            await self.page.goto(publish_url, wait_until="networkidle", timeout=60000)
+            await self.page.goto(publish_url, wait_until="load", timeout=60000)
             await asyncio.sleep(3)
 
             current_url = self.page.url
@@ -379,8 +560,9 @@ class XianyuPublisher:
                     logger.error(f"页面内容: {page_text[:500]}")
                     raise Exception("页面可能不是发布页面，或者Cookie无效")
 
-            screenshot = await self.page.screenshot(full_page=True)
-            result["screenshot"] = base64.b64encode(screenshot).decode()
+            screenshot = await _safe_page_screenshot(self.page, full_page=True)
+            if screenshot:
+                result["screenshot"] = base64.b64encode(screenshot).decode()
 
             logger.info("✅ 登录状态正常")
             logger.info("\n⏳ 等待React应用渲染表单元素...")
@@ -496,8 +678,9 @@ class XianyuPublisher:
 
             if self.page:
                 try:
-                    screenshot = await self.page.screenshot(full_page=True)
-                    result["screenshot"] = base64.b64encode(screenshot).decode()
+                    screenshot = await _safe_page_screenshot(self.page, full_page=True)
+                    if screenshot:
+                        result["screenshot"] = base64.b64encode(screenshot).decode()
                 except Exception:
                     pass
 
@@ -507,9 +690,73 @@ class XianyuPublisher:
 
         return result
 
+    async def _setup_upload_network_capture(self):
+        """为当前 page 注册网络请求/响应监听，捕获上传相关的 API 调用。
+
+        上传图片时闲鱼会向 goofish 的 OSS/CDN 发 POST 请求，如果这些请求
+        失败（4xx/5xx/超时），图片就不会出现在预览区。通过监听可以定位原因。
+        """
+        self._upload_network_log: list[dict] = []
+
+        async def _on_request(request):
+            url = request.url
+            method = request.method
+            # 只记录与上传相关的请求（OSS/CDN/API）
+            if any(kw in url for kw in ("upload", "oss", "cdn", "mweb", "h5api", "img")):
+                post_data_len = 0
+                try:
+                    # 上传图片接口的 multipart body 是二进制，request.post_data 可能因 utf-8 decode 抛错
+                    sizes = await request.sizes()
+                    post_data_len = sizes.get("requestBodySize") or 0
+                except Exception:
+                    post_data_len = 0
+                entry = {
+                    "type": "request",
+                    "method": method,
+                    "url": url[:200],
+                    "post_data_len": post_data_len,
+                }
+                self._upload_network_log.append(entry)
+                logger.debug(f"📤 [上传网络] {method} {url[:150]} (body={post_data_len}B)")
+
+        async def _on_response(response):
+            url = response.url
+            status = response.status
+            if any(kw in url for kw in ("upload", "oss", "cdn", "mweb", "h5api", "img")):
+                entry = {
+                    "type": "response",
+                    "status": status,
+                    "url": url[:200],
+                }
+                self._upload_network_log.append(entry)
+                status_icon = "✅" if 200 <= status < 300 else "❌"
+                logger.info(f"📥 [上传网络] {status_icon} {status} {url[:150]}")
+
+        self.page.on("request", _on_request)
+        self.page.on("response", _on_response)
+        logger.info("📡 [上传网络] 已注册网络请求监听")
+
+    def _dump_upload_network_log(self):
+        """输出上传网络日志摘要。"""
+        if not getattr(self, "_upload_network_log", None):
+            logger.warning("📡 [上传网络] 无网络日志记录")
+            return
+        reqs = [e for e in self._upload_network_log if e["type"] == "request"]
+        resps = [e for e in self._upload_network_log if e["type"] == "response"]
+        failed = [e for e in resps if e["status"] >= 400]
+        logger.info(
+            f"📡 [上传网络] 汇总: {len(reqs)} 个请求, {len(resps)} 个响应, "
+            f"{len(failed)} 个失败"
+        )
+        for f in failed:
+            logger.error(f"📡 [上传网络] ❌ {f['status']} {f['url']}")
+
     async def _upload_images(self, images: list):
         """上传商品图片列表（按原项目流程）"""
         logger.info(f"[步骤4] 📷 上传 {len(images)} 张商品图片...")
+
+        # 注册网络监听，捕获上传 API 调用
+        await self._setup_upload_network_capture()
 
         add_image_selectors = [
             'span:has-text("添加首图")',
@@ -600,6 +847,13 @@ class XianyuPublisher:
                     logger.warning(f"⚠️ 图片文件不存在: {file_path}")
                     continue
 
+                # 上传前压缩到 500KB 以下，避免大图上传超时/卡住
+                file_path = self._compress_image_for_upload(file_path)
+
+                # 诊断：压缩后文件大小
+                compressed_size = os.path.getsize(file_path)
+                logger.info(f"📊 [上传诊断] 压缩后文件: {os.path.basename(file_path)}, 大小: {compressed_size}B ({compressed_size // 1024}KB)")
+
                 file_input = None
                 file_input_selectors = [
                     'input[type="file"][accept*="image"]',
@@ -611,48 +865,149 @@ class XianyuPublisher:
                     try:
                         file_input = await self.page.query_selector(selector)
                         if file_input:
-                            logger.info(f"找到文件输入框: {selector}")
+                            # 诊断：file input 元素状态
+                            fi_type = await file_input.get_attribute("type") or ""
+                            fi_accept = await file_input.get_attribute("accept") or ""
+                            fi_visible = await file_input.is_visible()
+                            fi_enabled = await file_input.is_enabled()
+                            fi_multiple = await file_input.get_attribute("multiple") or ""
+                            logger.info(
+                                f"📊 [上传诊断] 找到文件输入框: {selector} | "
+                                f"type={fi_type} accept={fi_accept} "
+                                f"visible={fi_visible} enabled={fi_enabled} "
+                                f"multiple={fi_multiple}"
+                            )
                             break
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"📊 [上传诊断] selector {selector} 查询异常: {e}")
                         continue
 
                 if not file_input:
-                    logger.error(f"未找到文件输入框，跳过第 {i} 张图片")
+                    # 诊断：列出页面上所有 input 元素
+                    all_inputs = await self.page.query_selector_all("input")
+                    logger.error(
+                        f"📊 [上传诊断] 未找到文件输入框！页面上共 {len(all_inputs)} 个 input 元素"
+                    )
+                    for idx, inp in enumerate(all_inputs[:10]):
+                        try:
+                            inp_type = await inp.get_attribute("type") or "?"
+                            inp_accept = await inp.get_attribute("accept") or ""
+                            inp_visible = await inp.is_visible()
+                            logger.info(
+                                f"📊 [上传诊断]   input[{idx}]: type={inp_type} "
+                                f"accept={inp_accept} visible={inp_visible}"
+                            )
+                        except Exception:
+                            pass
                     continue
 
                 logger.info(f"正在上传图片 {i}（直接写入文件输入框，避免弹出系统选择窗口）...")
-                await file_input.set_input_files(file_path)
+                # 读文件内容用 buffer 传递，不依赖路径，本地/远程模式都生效。
+                # 压缩后统一为 JPEG。
+                try:
+                    with open(file_path, "rb") as _f:
+                        _content = _f.read()
+                    logger.info(
+                        f"📊 [上传诊断] set_input_files buffer 模式: "
+                        f"name={os.path.basename(file_path)}, "
+                        f"mimeType=image/jpeg, buffer={len(_content)}B"
+                    )
+                    await file_input.set_input_files({
+                        "name": os.path.basename(file_path),
+                        "mimeType": "image/jpeg",
+                        "buffer": _content,
+                    })
+                    logger.info(f"📊 [上传诊断] set_input_files buffer 模式执行成功")
+                except Exception as set_err:
+                    # 个别 patchright 版本不支持 dict 形式，回退路径
+                    logger.warning(f"📊 [上传诊断] buffer 方式上传失败，回退路径: {set_err}")
+                    try:
+                        await file_input.set_input_files(file_path)
+                        logger.info(f"📊 [上传诊断] set_input_files 路径模式执行成功")
+                    except Exception as path_err:
+                        logger.error(f"📊 [上传诊断] 路径模式也失败: {path_err}")
+                        # 最后尝试：先点击使 file input 获取焦点，再 set
+                        try:
+                            await file_input.focus()
+                            await asyncio.sleep(0.3)
+                            await file_input.set_input_files(file_path)
+                            logger.info(f"📊 [上传诊断] focus+路径模式执行成功")
+                        except Exception as focus_err:
+                            logger.error(f"📊 [上传诊断] 所有上传方式均失败: {focus_err}")
+                            raise
                 logger.info(f"✅ 已选择图片 {i}")
 
-                await asyncio.sleep(5)
-
-                success_indicators = [
-                    'img[src*="upload"]',
-                    '.imgList img',
-                    '[class*="uploaded"] img',
-                    '[class*="image-item"] img',
-                    'img[src*="temp"]',
-                    'img[class*="img"]',
-                    '[class*="image"] img',
-                    '[class*="photo"] img',
-                    '[class*="thumb"] img',
-                ]
-
+                # 等待闲鱼服务端真正完成上传：
+                # 仅凭 input value 清空不够，必须看到预览图稳定出现，
+                # 否则 UI 仍可能认为“未上传任何图片”。
                 uploaded = False
-                for indicator in success_indicators:
+                preview_confirmed = False
+                last_preview_src = ""
+                for attempt in range(30):
+                    await asyncio.sleep(1)
                     try:
-                        uploaded_images = await self.page.query_selector_all(indicator)
-                        if len(uploaded_images) >= i:
-                            logger.info(f"✅ 图片 {i} 上传成功 (找到 {len(uploaded_images)} 张图片, 使用选择器: {indicator})")
-                            uploaded = True
-                            uploaded_count += 1
-                            break
-                    except Exception:
-                        continue
+                        val = await file_input.get_attribute("value") or ""
+                        preview = await self.page.query_selector(
+                            '[class*="image-item"] img, [class*="uploaded"] img, .imgList img, img[src*="alicdn.com"], img[src*="goofish.com"]'
+                        )
+                        preview_src = ""
+                        if preview:
+                            preview_src = (await preview.get_attribute("src") or "").strip()
 
-                if not uploaded:
-                    logger.warning(f"⚠️ 图片 {i} 上传状态不明确，继续")
+                        if preview_src and not preview_src.endswith(".loading"):
+                            preview_confirmed = True
+                            last_preview_src = preview_src
+                            logger.info(
+                                f"📊 [上传诊断] 图片 {i} 预览已出现: {preview_src[:120]}... (第 {attempt+1}s)"
+                            )
+                            uploaded = True
+                            break
+
+                        if not val:
+                            logger.info(
+                                f"📊 [上传诊断] 图片 {i} input value 已清空，但预览仍未出现 (第 {attempt+1}s)"
+                            )
+                    except Exception as check_err:
+                        logger.debug(f"📊 [上传诊断] 上传确认检查异常 (第 {attempt+1}s): {check_err}")
+                if uploaded:
                     uploaded_count += 1
+                    logger.info(f"✅ 图片 {i} 已上传至服务端且预览已出现")
+                else:
+                    logger.warning(f"⚠️ 图片 {i} 等待 30s 后仍未确认预览出现")
+                    try:
+                        loading_nodes = await self.page.query_selector_all(
+                            '[class*="loading"], [class*="uploading"], [class*="progress"], [class*="spinner"]'
+                        )
+                        logger.warning(f"📊 [上传诊断] 当前加载态节点数: {len(loading_nodes)}")
+                        for node in loading_nodes[:5]:
+                            try:
+                                txt = (await node.inner_text()).strip()
+                                cls = await node.get_attribute("class") or ""
+                                logger.warning(f"📊 [上传诊断] loading节点 class={cls[:120]} text={txt[:120]}")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    try:
+                        page_text = await self.page.evaluate("() => document.body.innerText")
+                        if "请至少上传一张图片" in page_text:
+                            logger.warning("📊 [上传诊断] 页面已出现『请至少上传一张图片』提示")
+                    except Exception:
+                        pass
+                    # 诊断：检查当前页面上是否有错误提示
+                    try:
+                        error_toasts = await self.page.query_selector_all(
+                            '[class*="error"], [class*="toast"], [class*="message"], [role="alert"]'
+                        )
+                        for toast in error_toasts[:3]:
+                            try:
+                                txt = await toast.inner_text()
+                                if txt and len(txt) < 200:
+                                    logger.warning(f"📊 [上传诊断] 页面提示: {txt}")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
 
                 if i < len(images):
                     await asyncio.sleep(2)
@@ -690,9 +1045,11 @@ class XianyuPublisher:
                 continue
 
         if uploaded_count == 0:
-            raise Exception("❌ 没有成功上传任何图片")
+            self._dump_upload_network_log()
+            raise Exception("❌ 没有成功上传任何图片（预览未稳定出现）")
 
-        logger.info(f"✅ 共上传 {uploaded_count}/{len(images)} 张图片")
+        logger.info(f"✅ 共上传 {uploaded_count}/{len(images)} 张图片（按预览出现判定）")
+        self._dump_upload_network_log()
 
     async def _set_item_address(self, item_data: dict):
         address = (item_data.get("address") or "").strip()
@@ -1858,6 +2215,35 @@ class XianyuPublisher:
             publish_target = self.page.locator(publish_btn_selector).first if publish_btn_selector else None
             if publish_target is None:
                 raise Exception("未找到可用的发布按钮定位器")
+
+            # 注册发布 API 网络监听，捕获发布请求和响应
+            publish_api_log: list[dict] = []
+
+            async def _on_publish_request(request):
+                url = request.url
+                method = request.method
+                if any(kw in url for kw in ("mtop.idle.item.publish", "mtop.taobao.idle.item.publish", "publish")):
+                    entry = {"type": "request", "method": method, "url": url[:200]}
+                    publish_api_log.append(entry)
+                    logger.info(f"📤 [发布API] {method} {url[:150]}")
+
+            async def _on_publish_response(response):
+                url = response.url
+                status = response.status
+                if any(kw in url for kw in ("mtop.idle.item.publish", "mtop.taobao.idle.item.publish", "publish")):
+                    entry = {"type": "response", "status": status, "url": url[:200]}
+                    publish_api_log.append(entry)
+                    # 尝试读取响应体
+                    try:
+                        body = await response.text()
+                        entry["body_preview"] = body[:500]
+                        logger.info(f"📥 [发布API] {status} {url[:100]} body={body[:300]}")
+                    except Exception:
+                        logger.info(f"📥 [发布API] {status} {url[:100]} (body不可读)")
+
+            self.page.on("request", _on_publish_request)
+            self.page.on("response", _on_publish_response)
+
             await publish_target.click(timeout=5000)
 
             logger.info("\n[步骤15] ⏳ 等待发布完成...")
@@ -1867,24 +2253,48 @@ class XianyuPublisher:
             logger.info("检查页面是否跳转...")
             await asyncio.sleep(3)
 
-            screenshot_after = await self.page.screenshot(full_page=True)
-            result["screenshot"] = base64.b64encode(screenshot_after).decode()
+            # 输出发布 API 网络日志
+            if publish_api_log:
+                reqs = [e for e in publish_api_log if e["type"] == "request"]
+                resps = [e for e in publish_api_log if e["type"] == "response"]
+                failed = [e for e in resps if e["status"] >= 400]
+                logger.info(
+                    f"📡 [发布API] 汇总: {len(reqs)} 个请求, {len(resps)} 个响应, "
+                    f"{len(failed)} 个失败"
+                )
+                for f in failed:
+                    logger.error(f"📡 [发布API] ❌ {f['status']} {f.get('url', '')} {f.get('body_preview', '')[:200]}")
+                # 如果有成功的发布 API 响应，检查响应体里是否有真正的成功标记
+                for r in resps:
+                    if r["status"] < 400:
+                        body = r.get("body_preview", "")
+                        if '"SUCCESS"' in body or '"success":true' in body or 'ret":["SUCCESS::' in body:
+                            logger.info(f"📡 [发布API] ✅ 响应体包含成功标记")
+                        elif 'FAIL' in body or 'fail' in body or 'error' in body.lower() or 'rater' in body.lower():
+                            logger.warning(f"📡 [发布API] ⚠️ 响应体可能表示失败: {body[:200]}")
+            else:
+                logger.warning("📡 [发布API] 未捕获到任何发布 API 请求（可能请求未发出或 URL 不匹配）")
+
+            screenshot_after = await _safe_page_screenshot(self.page, full_page=True)
+            if screenshot_after:
+                result["screenshot"] = base64.b64encode(screenshot_after).decode()
 
             current_url = self.page.url
             logger.info(f"当前页面URL: {current_url}")
 
             page_text = await self.page.evaluate('() => document.body.innerText')
 
-            is_item_page = '/item/' in current_url or 'id=' in current_url
+            # 1. URL path 已进入 /item 且 query 中有数字 id → 确认成功。
+            # 注意详情页会保留 spm=a21ybx.publish...；不能用整个 URL 是否含 publish 判断，
+            # 否则真实详情页会被误判成仍停留在发布页。
+            item_id = _item_id_from_url(current_url)
+            is_item_page = item_id is not None
 
             if is_item_page:
                 result["success"] = True
                 result["message"] = '商品发布成功（已跳转到商品详情页）'
                 result["item_url"] = current_url
-
-                item_id_match = re.search(r'id=(\d+)', current_url)
-                if item_id_match:
-                    result["item_id"] = item_id_match.group(1)
+                result["item_id"] = item_id
 
                 logger.info("✅✅✅ 商品发布成功！")
                 logger.info("✅ 已跳转到商品详情页")
@@ -1898,30 +2308,74 @@ class XianyuPublisher:
                     logger.info("⚠️ 未找到下架和删除按钮，但URL已跳转到商品详情页")
                     result["success_flag"] = 'url_jumped'
 
-            elif '发布成功' in page_text or '已发布' in page_text:
+            # 2. URL path 仍为 /publish → 需要其他明确成功证据
+            elif _is_publish_page_url(current_url) or '发闲置' in current_url:
+                # 发布页本身就有"发布"字样，加上某些元素可能含"成功"，
+                # 但只要 URL 没跳走就说明发布没真正完成。
+                # 检查是否有明确的"发布成功"toast/弹窗（而非页面固有文案）
+                has_publish_success_toast = False
+                try:
+                    toast = await self.page.query_selector(
+                        '[class*="toast"] [class*="success"], '
+                        '[class*="message"] [class*="success"], '
+                        '[role="alert"]:has-text("发布成功"), '
+                        '[class*="Notice"]:has-text("发布成功"), '
+                        '[class*="notice"]:has-text("发布成功")'
+                    )
+                    if toast and await toast.is_visible():
+                        toast_text = await toast.inner_text()
+                        if "发布成功" in toast_text or "上架成功" in toast_text:
+                            has_publish_success_toast = True
+                            logger.info(f"✅ 检测到发布成功弹窗: {toast_text}")
+                except Exception:
+                    pass
+
+                if has_publish_success_toast:
+                    # 有明确的成功弹窗，但 URL 没跳 → 等一下看是否跳转
+                    logger.info("检测到成功弹窗但URL未跳转，等待5秒看是否跳转...")
+                    await asyncio.sleep(5)
+                    current_url = self.page.url
+                    item_id = _item_id_from_url(current_url)
+                    if item_id:
+                        result["success"] = True
+                        result["message"] = '商品发布成功（弹窗后跳转到商品详情页）'
+                        result["item_url"] = current_url
+                        result["item_id"] = item_id
+                        logger.info(f"✅✅✅ 弹窗后已跳转到商品详情页: {current_url}")
+                    else:
+                        result["success"] = False
+                        result["message"] = '发布可能未真正成功（有成功弹窗但URL未跳转到商品详情页）'
+                        result["failure_reason"] = 'page_not_redirected_despite_toast'
+                        logger.warning("⚠️ 有成功弹窗但URL未跳转到商品详情页，判为未成功")
+                        logger.warning(f"⚠️ 当前URL: {current_url}")
+                else:
+                    result["success"] = False
+                    result["message"] = '发布失败（页面未跳转，仍停留在发布页）'
+                    result["failure_reason"] = 'page_not_redirected'
+                    logger.warning("⚠️ 发布失败：页面未跳转，仍停留在发布页")
+                    logger.warning(f"⚠️ 当前URL: {current_url}")
+                    # 打印页面上的提示信息帮助诊断
+                    for keyword in ["失败", "错误", "风控", "限制", "违规", "审核", "频繁", "稍后"]:
+                        if keyword in page_text:
+                            logger.warning(f"⚠️ 页面含关键词「{keyword}」")
+                    # 打印发布 API 响应中的失败信息
+                    for e in publish_api_log:
+                        if e["type"] == "response":
+                            body = e.get("body_preview", "")
+                            if body and ("FAIL" in body or "error" in body.lower() or "rater" in body.lower()):
+                                logger.warning(f"⚠️ 发布API响应可能失败: {body[:300]}")
+
+            # 3. 其他 URL（非 publish 也非 item）→ 检查页面文本
+            elif '发布成功' in page_text or '上架成功' in page_text:
                 result["success"] = True
                 result["message"] = '商品发布成功（页面显示成功提示）'
                 logger.info("✅✅✅ 商品发布成功（页面显示成功提示）")
-
-            elif '成功' in page_text and ('发布' in page_text or '上架' in page_text):
-                result["success"] = True
-                result["message"] = '商品发布成功（检测到成功提示）'
-                logger.info("✅✅✅ 商品发布成功（检测到成功提示）")
 
             elif '发布失败' in page_text or '失败' in page_text or '错误' in page_text:
                 result["success"] = False
                 result["message"] = '商品发布失败，页面显示错误提示'
                 result["failure_reason"] = 'error_message_detected'
                 logger.error("❌ 商品发布失败，页面显示错误提示")
-
-            elif '发闲置' in current_url or 'publish' in current_url:
-                result["success"] = False
-                result["message"] = '可能发布失败（页面未跳转，仍停留在发布页）'
-                result["failure_reason"] = 'page_not_redirected'
-                logger.warning("⚠️ 可能发布失败")
-                logger.warning("⚠️ 页面未跳转，仍停留在发布页")
-                logger.warning(f"⚠️ 当前URL: {current_url}")
-                logger.warning("⚠️ 可能原因：宝贝所在地未设置、内容触发审核、账号风控等")
 
             else:
                 result["success"] = False
@@ -1930,7 +2384,6 @@ class XianyuPublisher:
                 logger.warning("⚠️ 无法确认发布状态")
                 logger.warning(f"⚠️ 当前URL: {current_url}")
                 logger.warning(f"⚠️ 页面文本: {page_text[:200]}")
-                logger.warning("⚠️ 可能原因：宝贝所在地未设置、内容触发审核、账号风控等")
 
         else:
             result["message"] = '未找到发布按钮'
@@ -1953,11 +2406,20 @@ class XianyuPublisher:
             if self.page:
                 await self.page.close()
                 self.page = None
+            # 远程 CDP 模式：只关闭本实例新建的 context，绝不 close browser（会杀宿主 Chrome）
             if self.context:
-                await self.context.close()
+                if self._remote_cdp_mode and not self._cdp_context_owned:
+                    logger.debug("CDP 模式：复用的宿主 context，跳过关闭")
+                else:
+                    await self.context.close()
                 self.context = None
+            if self.browser and not self._remote_cdp_mode:
+                await self.browser.close()
+            self.browser = None
             self.is_initialized = False
             self.current_cookie = None
+            self._remote_cdp_mode = False
+            self._cdp_context_owned = False
             logger.info("✅ 浏览器已关闭（保持playwright运行）")
         except Exception as e:
             logger.error(f"关闭浏览器时出错: {e}")
@@ -1972,13 +2434,22 @@ class XianyuPublisher:
                 await self.page.close()
                 self.page = None
             if self.context:
-                await self.context.close()
+                if self._remote_cdp_mode and not self._cdp_context_owned:
+                    logger.debug("CDP 模式：复用的宿主 context，跳过关闭")
+                else:
+                    await self.context.close()
                 self.context = None
+            # 远程 CDP 模式：browser 是宿主共享 Chrome，close() 会杀掉整个宿主浏览器，跳过
+            if self.browser and not self._remote_cdp_mode:
+                await self.browser.close()
+            self.browser = None
             if self.playwright:
                 await self.playwright.stop()
                 self.playwright = None
             self.is_initialized = False
             self.current_cookie = None
+            self._remote_cdp_mode = False
+            self._cdp_context_owned = False
             logger.info("✅ 浏览器和playwright已关闭")
         except Exception as e:
             logger.error(f"关闭浏览器时出错: {e}")

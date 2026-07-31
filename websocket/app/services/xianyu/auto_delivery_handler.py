@@ -258,9 +258,12 @@ class AutoDeliveryHandler:
                 if attempt > 0:
                     logger.info(f"【{self.cookie_id}】图片重试第{attempt}次发送成功: {image_url[:50]}...")
                 return result
+            error_msg = result.get("error_message", "未知错误") if isinstance(result, dict) else "返回值异常"
+            if isinstance(result, dict) and result.get("retryable") is False:
+                logger.error(f"【{self.cookie_id}】发送图片失败(不可重试): {error_msg}")
+                return result
             if attempt >= max_retries:
                 break
-            error_msg = result.get("error_message", "未知错误") if isinstance(result, dict) else "返回值异常"
             logger.warning(f"【{self.cookie_id}】发送图片失败(第{attempt+1}次): {error_msg}，{retry_delay}秒后重试...")
             await asyncio.sleep(retry_delay)
             try:

@@ -108,11 +108,12 @@ class XianyuSliderStealth(PlaywrightSliderService):
         logger.info(f"【{self.pure_user_id}】账号: {account}")
         logger.info("=" * 60)
         
-        # 设置headless模式
-        # Docker环境下强制无头模式（容器内无显示器，有头模式会报错）
-        if show_browser and os.environ.get("BROWSER_HEADLESS", "").lower() == "true":
-            logger.info(f"【{self.pure_user_id}】检测到BROWSER_HEADLESS=true，忽略show_browser，强制使用无头模式")
+        # 密码登录与滑块验证共用 CAPTCHA_BROWSER_HEADLESS 配置；未配置时尊重 show_browser。
+        captcha_headless = os.environ.get("CAPTCHA_BROWSER_HEADLESS", "").strip().lower()
+        if captcha_headless in ("true", "1", "yes"):
             self.headless = True
+        elif captcha_headless in ("false", "0", "no"):
+            self.headless = False
         else:
             self.headless = not show_browser
         

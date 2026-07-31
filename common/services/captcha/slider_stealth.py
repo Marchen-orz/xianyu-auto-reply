@@ -55,6 +55,31 @@ CAPTCHA_NOT_REQUIRED = "__CAPTCHA_NOT_REQUIRED__"
 # 以 engine='url_expired' 上报，最终让远程调用方据此刷新 URL 后重试。
 URL_EXPIRED = "__URL_EXPIRED__"
 
+
+def _captcha_remote_cdp_url() -> str:
+    """读取发布与验证码共用的宿主 Chrome CDP 地址。"""
+    return (
+        os.environ.get("CAPTCHA_REMOTE_CDP_URL")
+        or os.environ.get("PUBLISH_REMOTE_CDP_URL")
+        or ""
+    ).strip()
+
+
+def _captcha_remote_cdp_enabled() -> bool:
+    value = os.environ.get("CAPTCHA_REMOTE_CDP_ENABLED", "").strip().lower()
+    if value in ("true", "1", "yes"):
+        return True
+    if value in ("false", "0", "no"):
+        return False
+    return bool(_captcha_remote_cdp_url())
+
+
+def _captcha_remote_cdp_fallback() -> bool:
+    return os.environ.get("CAPTCHA_REMOTE_CDP_FALLBACK_TO_LOCAL", "true").strip().lower() not in (
+        "false", "0", "no"
+    )
+
+
 # 与真实鼠标模式保持一致的最小注入：仅隐藏 webdriver 并记录坐标校准事件。
 _STEALTH_MINIMAL = """
 try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true }); } catch (e) {}
@@ -265,10 +290,15 @@ class PlaywrightSliderService:
 
         self.user_id = user_id
         self.enable_learning = enable_learning
-        # Docker环境下强制无头模式（容器内无显示器，有头模式会报错）
-        if not headless and os.environ.get("BROWSER_HEADLESS", "").lower() == "true":
-            logger.info(f"【{user_id}】检测到BROWSER_HEADLESS=true，强制使用无头模式")
+        # 验证码浏览器单独由 CAPTCHA_BROWSER_HEADLESS 控制；未配置时尊重调用方。
+        # 不再让 websocket 的通用 BROWSER_HEADLESS 覆盖 caller 传入的 headed 模式。
+        captcha_headless = os.environ.get("CAPTCHA_BROWSER_HEADLESS", "").strip().lower()
+        if captcha_headless in ("true", "1", "yes"):
             headless = True
+            logger.info(f"【{user_id}】CAPTCHA_BROWSER_HEADLESS=true，使用无头验证码浏览器")
+        elif captcha_headless in ("false", "0", "no"):
+            headless = False
+            logger.info(f"【{user_id}】CAPTCHA_BROWSER_HEADLESS=false，使用有头验证码浏览器")
         self.headless = headless
 
         self.pure_user_id = concurrency_manager._extract_pure_user_id(user_id)
@@ -277,6 +307,9 @@ class PlaywrightSliderService:
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
+        # 远程 CDP 模式复用宿主 Chrome 默认 context，仅拥有本次创建的验证码页签。
+        self._remote_cdp_mode = False
+        self._cdp_context_owned = False
 
         # 真人轨迹回放模式：复刻真实鼠标引擎的共享浏览器目录
         self._human_trail_mode = _is_human_trail_enabled()
@@ -409,6 +442,63 @@ class PlaywrightSliderService:
             
             self.playwright = sync_playwright().start()
             logger.info(f"【{self.pure_user_id}】Playwright启动成功")
+
+            # ── 优先复用发布使用的宿主 Chrome/CDP 环境 ──
+            cdp_url = _captcha_remote_cdp_url()
+            if _captcha_remote_cdp_enabled() and cdp_url:
+                logger.info(f"【{self.pure_user_id}】验证码复用宿主 Chrome/CDP: {cdp_url}")
+                try:
+                    self.browser = self.playwright.chromium.connect_over_cdp(cdp_url, timeout=30000)
+                    contexts = list(self.browser.contexts)
+                    if not contexts:
+                        raise RuntimeError("宿主 Chrome 没有可复用的默认 context")
+                    # 与发布器一致：复用默认 context 的真实 profile，但仅创建本次验证码新页签。
+                    self.context = contexts[0]
+                    self._remote_cdp_mode = True
+                    self._cdp_context_owned = False
+                    self.page = self.context.new_page()
+                    self.page.set_default_timeout(30000)
+                    self.page.set_default_navigation_timeout(60000)
+                    if add_stealth_script:
+                        self.page.add_init_script(_STEALTH_MINIMAL)
+                        self.page.add_init_script(_CAP_JS)
+                    self.element_finder = SliderElementFinder(self.page, self.user_id)
+                    self.verification_checker = VerificationChecker(self.page, self.user_id)
+                    logger.info(f"【{self.pure_user_id}】验证码页签已在宿主 Chrome 默认环境中创建")
+                    return self.page
+                except Exception as cdp_error:
+                    self._remote_cdp_mode = False
+                    self._cdp_context_owned = False
+                    self.context = None
+                    self.browser = None
+                    if not _captcha_remote_cdp_fallback():
+                        raise
+                    logger.warning(
+                        f"【{self.pure_user_id}】连接宿主 Chrome/CDP 失败，回退本地浏览器: {cdp_error}"
+                    )
+
+            # Linux 有头模式必须有可用显示服务；Docker 场景通过宿主 X11 :99 挂载提供。
+            if not self.headless and sys.platform == "linux":
+                display = (
+                    os.environ.get("CAPTCHA_DISPLAY")
+                    or os.environ.get("DISPLAY")
+                    or ":99"
+                )
+                try:
+                    check = subprocess.run(
+                        ["xdpyinfo", "-display", display],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=3,
+                    )
+                except (FileNotFoundError, subprocess.SubprocessError) as e:
+                    raise RuntimeError(f"验证码无法检查虚拟显示屏 DISPLAY={display}: {e}") from e
+                if check.returncode != 0:
+                    raise RuntimeError(f"验证码无法连接虚拟显示屏 DISPLAY={display}")
+                # Chrome/Playwright 本身读取进程 DISPLAY，而不是 CAPTCHA_DISPLAY。
+                # 将其切到已验证的隐藏 Xvfb，避免仍继承 compose 的 DISPLAY=:99。
+                os.environ["DISPLAY"] = display
+                logger.info(f"【{self.pure_user_id}】验证码浏览器使用虚拟显示屏: DISPLAY={display}")
 
             # ── 真人轨迹回放模式：复刻真实鼠标引擎的浏览器环境 ──
             if self._human_trail_mode:
@@ -548,29 +638,25 @@ class PlaywrightSliderService:
                     slider_container, slider_button, slider_track = self.element_finder.find_slider_elements()
 
                     if not slider_button or not slider_track:
-                        # 滑块元素消失，可能是人工已手动通过验证，检查是否已成功
+                        # 滑块元素消失，可能是人工已手动通过验证，必须检查是否生成了新 x5sec。
                         logger.warning(f"【{self.pure_user_id}】未找到滑块元素，检查是否已验证通过...")
-                        
-                        # 检查1：x5sec cookie 是否已生成（验证通过的标志）
+
                         x5sec_value = self._read_x5sec_value()
-                        if x5sec_value:
-                            logger.info(f"【{self.pure_user_id}】✅ 未找到滑块但检测到 x5sec cookie，判定为验证已通过（可能人工完成）")
+                        if x5sec_value and x5sec_value != pre_x5sec:
+                            logger.info(f"【{self.pure_user_id}】✅ 未找到滑块但检测到新 x5sec cookie，判定为验证已通过（可能人工完成）")
                             return True
-                        
-                        # 检查2：页面是否已跳转离开验证页面
-                        try:
-                            current_url = self.page.url
-                            page_content = self.page.content()
-                            has_captcha_keywords = any(
-                                kw in page_content for kw in ["验证码", "captcha", "滑块", "nc_1_n1z", "nc-container"]
+                        if x5sec_value:
+                            logger.warning(
+                                f"【{self.pure_user_id}】未找到滑块但仅检测到滑动前已有的 x5sec，"
+                                "共享默认环境下不判定为本次验证成功"
                             )
-                            if not has_captcha_keywords:
-                                logger.info(f"【{self.pure_user_id}】✅ 页面已不包含验证元素，判定为验证已通过（可能人工完成），URL: {current_url}")
-                                return True
-                        except Exception as check_e:
-                            logger.warning(f"【{self.pure_user_id}】检查页面状态时出错: {check_e}")
-                        
-                        # 确实未通过，尝试点击重试按钮
+                        else:
+                            logger.warning(
+                                f"【{self.pure_user_id}】滑块元素消失但未检测到 x5sec，"
+                                "不判定为成功"
+                            )
+
+                        # 未拿到新 x5sec 时，页面元素消失并不能证明风控已放行。
                         logger.info(f"【{self.pure_user_id}】验证未通过，尝试点击重试按钮")
                         self._click_slider_refresh()
                         time.sleep(2)
@@ -710,7 +796,12 @@ class PlaywrightSliderService:
             """
             nonlocal timed_out
             timed_out = True
-            logger.error(f"【{self.pure_user_id}】⏰ 浏览器超时守护触发（{browser_timeout}秒），强制杀掉浏览器进程释放资源")
+            logger.error(f"【{self.pure_user_id}】⏰ 浏览器超时守护触发（{browser_timeout}秒）")
+            if self._remote_cdp_mode:
+                # 宿主 CDP 模式不能杀 Chrome；run() 的 finally 会在同线程关闭本次页签。
+                logger.warning(f"【{self.pure_user_id}】宿主 CDP 模式仅标记超时，保留宿主 Chrome")
+                return
+            logger.error(f"【{self.pure_user_id}】强制杀掉本地浏览器进程释放资源")
             killed = self._kill_browser_processes()
             if killed > 0:
                 logger.info(f"【{self.pure_user_id}】超时守护：已强杀 {killed} 个浏览器进程")
@@ -722,6 +813,9 @@ class PlaywrightSliderService:
         try:
             # 初始化浏览器
             self.init_browser()
+            # 共享默认 context 会保留历史 x5sec。导航前先做快照，避免普通页面或其他
+            # 账号留下的旧 cookie 被“页面无验证码”分支误报为本次验证成功。
+            pre_navigation_x5sec = self._read_x5sec_value()
             browser_start_time = time.time()
             logger.info(f"【{self.pure_user_id}】浏览器已启动，{browser_timeout}秒内未完成验证将自动关闭")
 
@@ -859,8 +953,17 @@ class PlaywrightSliderService:
                     logger.warning(f"【{self.pure_user_id}】滑块验证失败")
                     return False, None
             else:
-                logger.info(f"【{self.pure_user_id}】页面内容不包含验证码相关关键词，可能不需要验证")
-                return True, None
+                # 页面没有滑块文案也不能代表验证已通过；只有明确的
+                # CAPTCHA_NOT_REQUIRED 哨兵或 x5sec cookie 才能报告成功。
+                x5sec_value = self._read_x5sec_value()
+                if x5sec_value and x5sec_value != pre_navigation_x5sec:
+                    logger.info(f"【{self.pure_user_id}】页面无验证码元素且检测到新 x5sec，确认验证通过")
+                    return True, self._get_cookies_after_success()
+                if x5sec_value:
+                    logger.warning(f"【{self.pure_user_id}】页面无验证码元素但仅检测到共享环境旧 x5sec，不判定为成功")
+                else:
+                    logger.warning(f"【{self.pure_user_id}】页面无验证码元素且未检测到 x5sec，不判定为成功")
+                return False, None
 
         except Exception as e:
             if timed_out:
@@ -1005,30 +1108,25 @@ class PlaywrightSliderService:
                     slider_container, slider_button, slider_track = self.element_finder.find_slider_elements()
 
                     if not slider_button or not slider_track:
-                        # 滑块元素消失，可能是人工已手动通过验证，检查是否已成功
+                        # 滑块元素消失，可能是人工已手动通过验证，必须检查是否生成了新 x5sec。
                         logger.warning(f"【{self.pure_user_id}】未找到滑块元素，检查是否已验证通过...")
-                        
-                        # 检查1：x5sec cookie 是否已生成（验证通过的标志）
+
                         x5sec_value = self._read_x5sec_value()
-                        if x5sec_value:
-                            logger.info(f"【{self.pure_user_id}】✅ 未找到滑块但检测到 x5sec cookie，判定为验证已通过（可能人工完成）")
+                        if x5sec_value and x5sec_value != pre_x5sec:
+                            logger.info(f"【{self.pure_user_id}】✅ 未找到滑块但检测到新 x5sec cookie，判定为验证已通过（可能人工完成）")
                             return True
-                        
-                        # 检查2：页面是否已跳转离开验证页面
-                        try:
-                            current_url = self.page.url
-                            page_content = self.page.content()
-                            # 如果页面不再包含验证相关关键词，说明已通过
-                            has_captcha_keywords = any(
-                                kw in page_content for kw in ["验证码", "captcha", "滑块", "nc_1_n1z", "nc-container"]
+                        if x5sec_value:
+                            logger.warning(
+                                f"【{self.pure_user_id}】未找到滑块但仅检测到滑动前已有的 x5sec，"
+                                "共享默认环境下不判定为本次验证成功"
                             )
-                            if not has_captcha_keywords:
-                                logger.info(f"【{self.pure_user_id}】✅ 页面已不包含验证元素，判定为验证已通过（可能人工完成），URL: {current_url}")
-                                return True
-                        except Exception as check_e:
-                            logger.warning(f"【{self.pure_user_id}】检查页面状态时出错: {check_e}")
-                        
-                        # 确实未通过，尝试点击重试按钮
+                        else:
+                            logger.warning(
+                                f"【{self.pure_user_id}】滑块元素消失但未检测到 x5sec，"
+                                "不判定为成功"
+                            )
+
+                        # 未拿到新 x5sec 时，页面元素消失并不能证明风控已放行。
                         logger.info(f"【{self.pure_user_id}】验证未通过，尝试点击重试按钮")
                         self._click_slider_refresh()
                         time.sleep(2)
@@ -1632,22 +1730,28 @@ class PlaywrightSliderService:
             if "cannot switch to a different thread" not in str(e):
                 logger.warning(f"【{pure_id}】关闭页面时出错: {e}")
 
-        # 关闭上下文（持久化上下文模式下，关闭context即可）
+        # 关闭上下文：远程 CDP 默认 context 属于宿主 Chrome，绝不能关闭。
         try:
             if hasattr(self, 'context') and self.context:
-                self.context.close()
-                logger.debug(f"【{pure_id}】上下文已关闭")
+                if self._remote_cdp_mode and not self._cdp_context_owned:
+                    logger.debug(f"【{pure_id}】CDP模式复用宿主 context，跳过关闭")
+                else:
+                    self.context.close()
+                    logger.debug(f"【{pure_id}】上下文已关闭")
                 self.context = None
         except Exception as e:
             # 忽略线程错误，这是正常的清理过程
             if "cannot switch to a different thread" not in str(e):
                 logger.warning(f"【{pure_id}】关闭上下文时出错: {e}")
 
-        # 持久化上下文模式下，browser可能为None，跳过关闭
+        # 远程 CDP 模式的 browser 是宿主 Chrome，绝不能关闭。
         try:
             if hasattr(self, 'browser') and self.browser:
-                self.browser.close()
-                logger.info(f"【{pure_id}】浏览器已关闭")
+                if self._remote_cdp_mode:
+                    logger.debug(f"【{pure_id}】CDP模式复用宿主 Chrome，跳过关闭")
+                else:
+                    self.browser.close()
+                    logger.info(f"【{pure_id}】浏览器已关闭")
                 self.browser = None
         except Exception as e:
             # 忽略线程错误，这是正常的清理过程

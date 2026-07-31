@@ -1336,24 +1336,17 @@ class AutoReplyService:
                 return f"__IMAGE_SEND__||{image_url}"
             
             elif image_url.startswith("/static/uploads/") or image_url.startswith("static/uploads/"):
-                # 使用STATIC_DIR环境变量（Docker共享卷），本地回退到backend-web/static
-                from pathlib import Path
-                _static_env = os.environ.get("STATIC_DIR", "")
-                if _static_env:
-                    static_root = Path(_static_env)
-                    if not static_root.is_absolute():
-                        static_root = Path.cwd() / static_root
-                else:
-                    static_root = Path(__file__).resolve().parent.parent.parent.parent.parent / "backend-web" / "static"
-                # 转换URL路径为本地文件路径
-                relative_path = image_url.lstrip('/').replace('static/', '', 1)
-                local_path = str(static_root / relative_path)
-                if os.path.exists(local_path):
+                from common.utils.static_paths import get_static_root, resolve_static_url_to_path
+
+                resolved_path = resolve_static_url_to_path(image_url)
+                static_root = get_static_root()
+                local_path = str(resolved_path) if resolved_path else ""
+                if resolved_path and resolved_path.exists():
                     logger.info(f"准备上传本地图片到闲鱼CDN: {local_path}")
                     # 本地图片需要上传，传递KW:keyword用于后续更新
                     return f"__IMAGE_SEND__|KW:{keyword}|{image_url}"
                 else:
-                    logger.error(f"本地图片文件不存在: {local_path}")
+                    logger.error(f"本地图片文件不存在: {local_path} (STATIC_DIR={static_root})")
                     return "抱歉,图片文件不存在。"
             else:
                 logger.info(f"使用外部图片链接: {image_url}")
