@@ -215,9 +215,6 @@ class ServiceManager:
             f"BACKUP_DIR={backup_dir}\n"
             f"FRONTEND_PUBLIC_URL=http://127.0.0.1:9000\n"
             f"BACKEND_WEB_PUBLIC_URL=http://127.0.0.1:8089\n"
-            f"PUBLISH_REMOTE_CDP_ENABLED=true\n"
-            f"PUBLISH_REMOTE_CDP_URL=http://127.0.0.1:9223\n"
-            f"PUBLISH_REMOTE_CDP_FALLBACK_TO_LOCAL=false\n"
         )
 
         # websocket .env
@@ -236,9 +233,6 @@ class ServiceManager:
             f"WEBSOCKET_PORT=8090\n"
             f"MAX_CAPTCHA_CONCURRENT=1\n"
             f"BROWSER_HEADLESS={str(config.get('browser_headless', True)).lower()}\n"
-            f"CAPTCHA_REMOTE_CDP_ENABLED=true\n"
-            f"CAPTCHA_REMOTE_CDP_URL=http://127.0.0.1:9223\n"
-            f"CAPTCHA_REMOTE_CDP_FALLBACK_TO_LOCAL=false\n"
             f"CAPTCHA_DRISSIONPAGE_HEADLESS={str(config.get('captcha_drissionpage_headless', True)).lower()}\n"
             f"TOKEN_REFRESH_INTERVAL=72000\n"
             f"TOKEN_RETRY_INTERVAL=7200\n"

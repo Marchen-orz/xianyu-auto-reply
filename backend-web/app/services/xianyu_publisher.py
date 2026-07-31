@@ -27,33 +27,6 @@ from common.utils.browser_utils import ensure_playwright_browser_path
 from common.services.publish_image_service import cleanup_temp_images, download_remote_image
 
 
-def _publish_remote_cdp_url() -> str:
-    """读取宿主机共享 Chrome 的 CDP 地址。
-
-    优先 PUBLISH_REMOTE_CDP_URL，回退 CAPTCHA_REMOTE_CDP_URL（与验证码共用同一个宿主 Chrome）。
-    """
-    return (
-        os.environ.get("PUBLISH_REMOTE_CDP_URL")
-        or os.environ.get("CAPTCHA_REMOTE_CDP_URL")
-        or ""
-    )
-
-
-def _publish_remote_cdp_enabled() -> bool:
-    val = os.environ.get("PUBLISH_REMOTE_CDP_ENABLED", "").lower()
-    if val in ("true", "1", "yes"):
-        return True
-    # 未显式设置时，只要配了 CDP 地址就默认启用（复用宿主虚拟屏 Chrome）
-    if val == "false":
-        return False
-    return bool(_publish_remote_cdp_url())
-
-
-def _publish_remote_cdp_fallback() -> bool:
-    val = os.environ.get("PUBLISH_REMOTE_CDP_FALLBACK_TO_LOCAL", "").lower()
-    return val not in ("false", "0", "no")
-
-
 def _item_id_from_url(url: str) -> Optional[str]:
     """仅按 URL path/query 判断商品详情页，避免 spm 中的 publish 造成误判。"""
     try:
@@ -233,9 +206,7 @@ class XianyuPublisher:
         self.temp_image_paths: list[str] = []
         self.static_root = Path(static_root) if static_root else None
         self._user_data_dir: Optional[str] = None
-        # 远程 CDP 模式：连接宿主机共享 Chrome，不再本地 launch，也不在 close() 时杀宿主 Chrome
-        self._remote_cdp_mode = False
-        self._cdp_context_owned = False
+        # 每次发布新建独立浏览器，不使用远程 CDP 模式（不再保留 `_remote_cdp_mode`）
 
     async def _resolve_upload_image_path(self, image_path: str) -> str:
         if re.match(r"^https?://", image_path, re.IGNORECASE):
@@ -331,14 +302,13 @@ class XianyuPublisher:
                 pass
 
     async def initialize(self, headless: bool = True, force_reinit: bool = False):
-        """初始化浏览器（对齐滑块验证码干净环境）
+        """初始化浏览器（每次发布新建独立实例，不复用远程宿主 Chrome）
 
-        优先连接宿主机共享 Chrome/CDP（与验证码同一个浏览器实例，画在 :99 虚拟屏上，
-        避免在同一个 DISPLAY 上再 launch 一个 Chrome 抢屏导致页面卡死）；
-        连接失败时回退本地 launch_persistent_context。
+        直接本地 launch_persistent_context，每次使用全新临时 profile，
+        发布完成后由调用方 close() 关闭浏览器。
 
         Args:
-            headless: 是否使用无头模式（仅本地回退路径生效）
+            headless: 是否使用无头模式
             force_reinit: 是否强制重新初始化（即使已经初始化）
         """
         if self.is_initialized and not force_reinit:
@@ -352,41 +322,7 @@ class XianyuPublisher:
         if not self.playwright:
             self.playwright = await async_playwright().start()
 
-        # ── 优先：连接宿主机共享 Chrome/CDP ──
-        cdp_url = _publish_remote_cdp_url()
-        if _publish_remote_cdp_enabled() and cdp_url:
-            logger.info(f"【商品发布】优先连接远程 CDP 浏览器: {cdp_url}")
-            try:
-                self.browser = await self.playwright.chromium.connect_over_cdp(
-                    cdp_url, timeout=30000,
-                )
-                # 复用 Chrome 默认 context（与 noVNC 手动操作完全相同的环境），
-                # 不新建 incognito context——incognito 无缓存/历史，goofish 会触发更严
-                # 反爬导致图片资源加载不出来。
-                contexts = list(self.browser.contexts)
-                if not contexts:
-                    raise RuntimeError("宿主 Chrome 没有可复用的默认 context")
-                self.context = contexts[0]
-                self._cdp_context_owned = False
-                logger.info("【商品发布】复用宿主 Chrome 默认 context")
-                self._remote_cdp_mode = True
-                # 所有注入仅作用于发布器自己的页签，避免污染验证码和人工页签。
-                self.page = await self.context.new_page()
-                await self.page.add_init_script(_STEALTH_MINIMAL)
-                await self.page.add_init_script(_CAL_JS)
-                self.page.set_default_timeout(30000)
-                self.page.set_default_navigation_timeout(60000)
-                self.is_initialized = True
-                logger.info("✅ 浏览器初始化成功（远程 CDP 模式，复用宿主虚拟屏 Chrome）")
-                return
-            except Exception as cdp_error:
-                self._remote_cdp_mode = False
-                self._cdp_context_owned = False
-                if not _publish_remote_cdp_fallback():
-                    raise
-                logger.warning(f"【商品发布】连接远程 CDP 失败，回退本地 launch: {cdp_error}")
-
-        # ── 回退：本地 launch_persistent_context ──
+        # ── 本地 launch_persistent_context ──
         # Docker环境下强制无头模式（容器内无显示器，有头模式会报错）
         if not headless and os.environ.get("BROWSER_HEADLESS", "").lower() == "true":
             logger.info("检测到BROWSER_HEADLESS=true，强制使用无头模式")
@@ -469,7 +405,6 @@ class XianyuPublisher:
         if not self.is_initialized or not self.context:
             raise Exception("浏览器未初始化")
 
-        # 只关闭发布器拥有的页签，不能影响同一 context 中的验证码或人工页签。
         if self.page:
             try:
                 await self.page.close()
@@ -477,9 +412,7 @@ class XianyuPublisher:
                 pass
 
         self.page = await self.context.new_page()
-        if self._remote_cdp_mode:
-            await self.page.add_init_script(_STEALTH_MINIMAL)
-            await self.page.add_init_script(_CAL_JS)
+        # context 级 init script 已在 initialize() 中通过 add_init_script 设置，新 page 自动生效
         self.page.set_default_timeout(30000)
         self.page.set_default_navigation_timeout(60000)
         logger.info("✅ 页面已重新创建（浏览器复用）")
@@ -2406,20 +2339,14 @@ class XianyuPublisher:
             if self.page:
                 await self.page.close()
                 self.page = None
-            # 远程 CDP 模式：只关闭本实例新建的 context，绝不 close browser（会杀宿主 Chrome）
             if self.context:
-                if self._remote_cdp_mode and not self._cdp_context_owned:
-                    logger.debug("CDP 模式：复用的宿主 context，跳过关闭")
-                else:
-                    await self.context.close()
+                await self.context.close()
                 self.context = None
-            if self.browser and not self._remote_cdp_mode:
+            if self.browser:
                 await self.browser.close()
             self.browser = None
             self.is_initialized = False
             self.current_cookie = None
-            self._remote_cdp_mode = False
-            self._cdp_context_owned = False
             logger.info("✅ 浏览器已关闭（保持playwright运行）")
         except Exception as e:
             logger.error(f"关闭浏览器时出错: {e}")
@@ -2434,13 +2361,9 @@ class XianyuPublisher:
                 await self.page.close()
                 self.page = None
             if self.context:
-                if self._remote_cdp_mode and not self._cdp_context_owned:
-                    logger.debug("CDP 模式：复用的宿主 context，跳过关闭")
-                else:
-                    await self.context.close()
+                await self.context.close()
                 self.context = None
-            # 远程 CDP 模式：browser 是宿主共享 Chrome，close() 会杀掉整个宿主浏览器，跳过
-            if self.browser and not self._remote_cdp_mode:
+            if self.browser:
                 await self.browser.close()
             self.browser = None
             if self.playwright:
@@ -2448,8 +2371,6 @@ class XianyuPublisher:
                 self.playwright = None
             self.is_initialized = False
             self.current_cookie = None
-            self._remote_cdp_mode = False
-            self._cdp_context_owned = False
             logger.info("✅ 浏览器和playwright已关闭")
         except Exception as e:
             logger.error(f"关闭浏览器时出错: {e}")
