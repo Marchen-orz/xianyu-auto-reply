@@ -330,7 +330,7 @@ class PlaywrightSliderService:
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
-self._remote_cdp_mode = False
+        self._remote_cdp_mode = False
         self._cdp_context_owned = False
         self._slide_response_code: Optional[int] = None
         self._cdp_touch_enabled = False
@@ -637,7 +637,6 @@ self._remote_cdp_mode = False
 
             # 添加最小反检测脚本（与真实鼠标模式保持一致）
             if add_stealth_script:
-if add_stealth_script:
                 logger.info(f"【{self.pure_user_id}】添加最小反检测脚本...")
                 self.page.add_init_script(_STEALTH_MINIMAL)
                 self.page.add_init_script(_CAP_JS)
