@@ -18,8 +18,21 @@ from app.core.config import get_settings
 from app.core.http_client import get_http_client
 from common.models.user import User, UserRole
 from common.schemas.common import ApiResponse
-from common.schemas.system_setting import SystemSettingUpdate
+from common.schemas.system_setting import RemoteTokenTestRequest, SystemSettingUpdate
 from app.services.system_setting_service import SENSITIVE_KEYS, SystemSettingService
+from common.services.remote_token_api import (
+    TOKEN_REMOTE_SECRET_KEY_SETTING_KEY,
+    TOKEN_REMOTE_URL_SETTING_KEY,
+    is_remote_token_empty_cookies_message,
+    request_remote_xianyu_token,
+    validate_remote_token_settings,
+)
+from common.services.remote_token_risk_log_service import record_remote_token_risk_log
+from common.services.token_api_mode import (
+    TOKEN_API_MODE_REMOTE,
+    TOKEN_API_MODE_SETTING_KEY,
+    TOKEN_API_MODES,
+)
 from common.utils.logging_utils import update_log_retention
 from common.utils.browser_utils import is_frozen
 
@@ -27,6 +40,15 @@ router = APIRouter(tags=["system_settings"])
 
 # 日志保留天数的设置键，与前端保持一致
 LOG_RETENTION_KEY = "log.retention_days"
+PASSWORD_LOGIN_MODE_KEY = "password_login.mode"
+PASSWORD_LOGIN_MODES = {"protocol", "browser"}
+CAPTCHA_SLIDER_MODE_KEY = "captcha.slider_mode"
+CAPTCHA_SLIDER_MODES = {"browser", "real_mouse"}
+TOKEN_REMOTE_SETTING_KEYS = {
+    TOKEN_API_MODE_SETTING_KEY,
+    TOKEN_REMOTE_URL_SETTING_KEY,
+    TOKEN_REMOTE_SECRET_KEY_SETTING_KEY,
+}
 
 NON_ADMIN_ALLOWED_KEYS = {
     "disclaimer.title",
@@ -101,6 +123,35 @@ async def _validate_proxy_setting(
             return "代理已启用，请先关闭代理再清空代理 API 的 URL"
 
     return None
+
+
+async def _validate_remote_token_setting(
+    key: str,
+    new_value: str,
+    service: SystemSettingService,
+) -> str | None:
+    """Token远程接口跨键校验，防止绕过前端保存非法配置。"""
+    if key not in TOKEN_REMOTE_SETTING_KEYS:
+        return None
+
+    current_settings = await service.list_settings()
+    target_mode = str(current_settings.get(TOKEN_API_MODE_SETTING_KEY) or "").strip().lower()
+    target_url = str(current_settings.get(TOKEN_REMOTE_URL_SETTING_KEY) or "").strip()
+    target_secret_key = str(
+        current_settings.get(TOKEN_REMOTE_SECRET_KEY_SETTING_KEY) or ""
+    ).strip()
+
+    if key == TOKEN_API_MODE_SETTING_KEY:
+        target_mode = str(new_value or "").strip().lower()
+    elif key == TOKEN_REMOTE_URL_SETTING_KEY:
+        target_url = str(new_value or "").strip()
+    elif key == TOKEN_REMOTE_SECRET_KEY_SETTING_KEY:
+        target_secret_key = str(new_value or "").strip()
+
+    if target_mode != TOKEN_API_MODE_REMOTE:
+        return None
+
+    return validate_remote_token_settings(target_url, target_secret_key)
 
 
 async def _notify_log_retention_service(
@@ -204,18 +255,47 @@ async def update_system_setting(
     if key in SENSITIVE_KEYS:
         return ApiResponse(success=False, message="该设置需要使用专用接口修改")
 
+    setting_value = payload.value
+    if key == PASSWORD_LOGIN_MODE_KEY:
+        setting_value = str(payload.value or "").strip().lower()
+        if setting_value == "auto":
+            setting_value = "browser"
+        if setting_value not in PASSWORD_LOGIN_MODES:
+            return ApiResponse(
+                success=False,
+                message="账号密码登录方式无效，请选择协议登录或浏览器登录",
+            )
+    if key == CAPTCHA_SLIDER_MODE_KEY:
+        setting_value = str(payload.value or "").strip().lower()
+        if setting_value not in CAPTCHA_SLIDER_MODES:
+            return ApiResponse(
+                success=False,
+                message="滑块滑动方式无效，请选择浏览器自动滑动或真实鼠标滑动",
+            )
+    if key == TOKEN_API_MODE_SETTING_KEY:
+        setting_value = str(payload.value or "").strip().lower()
+        if setting_value not in TOKEN_API_MODES:
+            return ApiResponse(
+                success=False,
+                message="Token获取方式无效，请选择网页接口或远程接口",
+            )
+
     retention_days: int | None = None
     if key == LOG_RETENTION_KEY:
-        retention_days, error_message = _parse_log_retention_days(payload.value)
+        retention_days, error_message = _parse_log_retention_days(setting_value)
         if error_message:
             return ApiResponse(success=False, message=error_message)
 
     # 代理设置跨键校验（开启代理必须已配置 URL；代理启用中不允许清空 URL）
-    proxy_error = await _validate_proxy_setting(key, payload.value, service)
+    proxy_error = await _validate_proxy_setting(key, setting_value, service)
     if proxy_error:
         return ApiResponse(success=False, message=proxy_error)
 
-    await service.set_setting(key, payload.value, payload.description)
+    remote_token_error = await _validate_remote_token_setting(key, setting_value, service)
+    if remote_token_error:
+        return ApiResponse(success=False, message=remote_token_error)
+
+    await service.set_setting(key, setting_value, payload.description)
 
     if retention_days is None:
         return ApiResponse(success=True, message="系统设置已更新")
@@ -258,3 +338,87 @@ async def test_email_send(
     
     success, message = await send_test_email(email)
     return ApiResponse(success=success, message=message)
+
+
+@router.post("/test-token-remote", response_model=ApiResponse)
+async def test_token_remote_interface(
+    payload: RemoteTokenTestRequest,
+    current_user: User = Depends(deps.get_current_admin_user),
+) -> ApiResponse:
+    """测试远程 Token 接口连通性与返回格式。"""
+    error_message = validate_remote_token_settings(
+        payload.remote_url,
+        payload.remote_secret_key,
+    )
+    if error_message:
+        return ApiResponse(success=False, message=error_message)
+
+    try:
+        result = await request_remote_xianyu_token(
+            payload.remote_url,
+            payload.remote_secret_key,
+            timeout_seconds=30,
+        )
+    except Exception as exc:
+        logger.error(f"测试远程Token接口异常: {type(exc).__name__}: {exc}")
+        await record_remote_token_risk_log(
+            account_identifier="系统设置远程接口测试",
+            success=False,
+            message=f"{type(exc).__name__}: {exc}",
+            owner_id=current_user.id,
+            call_user=current_user.username,
+            event_description="系统设置测试远程Token接口",
+        )
+        return ApiResponse(
+            success=False,
+            message=f"远程接口测试失败：{type(exc).__name__}: {exc}",
+        )
+
+    # 连通性测试传空 Cookie，远程接口仅抱怨 Cookie 长度时说明地址与秘钥已通过校验，视为测试通过
+    connectivity_only = not result.success and is_remote_token_empty_cookies_message(result.message)
+    connectivity_passed = result.success or connectivity_only
+
+    # 风控日志按「是否真的取到 Token」记录，避免出现「获取Token成功；说明：参数cookies长度不足」这类矛盾文案；
+    # 仅连通性通过的场景在事件描述中说明原因
+    await record_remote_token_risk_log(
+        account_identifier="系统设置远程接口测试",
+        success=result.success,
+        message=result.message,
+        api_mode=result.api_mode,
+        status_code=result.status_code,
+        duration_seconds=result.duration_seconds,
+        owner_id=current_user.id,
+        call_user=current_user.username,
+        event_description=(
+            "系统设置测试远程Token接口：地址与秘钥校验通过，因测试只传空Cookie未取Token"
+            if connectivity_only
+            else "系统设置测试远程Token接口"
+        ),
+    )
+
+    if not connectivity_passed:
+        return ApiResponse(
+            success=False,
+            message=f"远程接口返回：{result.message or '未返回错误说明'}",
+        )
+
+    if connectivity_only:
+        return ApiResponse(
+            success=True,
+            message="远程接口连通性测试成功，请点击保存",
+            data={
+                "token": "",
+                "device_id": "",
+                "api_mode": result.api_mode,
+            },
+        )
+
+    return ApiResponse(
+        success=True,
+        message="远程接口测试成功",
+        data={
+            "token": result.token,
+            "device_id": result.device_id,
+            "api_mode": result.api_mode,
+        },
+    )

@@ -150,6 +150,11 @@ class DatabaseInitializer:
             "日志保留天数（所有模块生效，修改后重启服务生效）",
         ),
         (
+            "password_login.mode",
+            "browser",
+            "账号密码登录模式：protocol/browser",
+        ),
+        (
             "captcha.real_mouse_weight_local",
             "1",
             "real_mouse过滑块本地排队权重",
@@ -167,7 +172,17 @@ class DatabaseInitializer:
         (
             "captcha.local_slider_disabled",
             "false",
-            "本机滑块是否停止处理并仅使用Token缓存",
+            "本机是否停止处理滑块；缓存缺失时仍请求Token接口",
+        ),
+        (
+            "captcha.slider_mode",
+            "browser",
+            "滑块滑动方式：browser/real_mouse",
+        ),
+        (
+            "token.api_mode",
+            "web",
+            "Token获取方式：web-网页接口/remote-远程接口",
         ),
         (
             "captcha.remote_processing_max",
@@ -267,7 +282,7 @@ class DatabaseInitializer:
             "Token续期任务",
             20,
             True,
-            "定时为已到期的启用账号预取IM Token，并写入续期到期日",
+            "定时为未来1小时内到期的启用账号预取IM Token，并写入续期到期日",
         ),
         (
             "cookies_refresh",
@@ -945,6 +960,27 @@ class DatabaseInitializer:
                 INDEX `idx_account_id` (`account_id`),
                 INDEX `idx_created_at` (`created_at`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='登录续期执行日志表';
+        """,
+
+        # 26.1.1 Token 续期执行日志表
+        "xy_scheduled_token_renewal_log": """
+            CREATE TABLE IF NOT EXISTS `xy_scheduled_token_renewal_log` (
+                `id` BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                `batch_id` VARCHAR(36) NOT NULL COMMENT '批次ID',
+                `account_id` VARCHAR(80) NOT NULL COMMENT '账号ID',
+                `token_user_id` VARCHAR(128) NOT NULL COMMENT 'Token缓存用户ID（myid）',
+                `status` VARCHAR(20) NOT NULL COMMENT '状态：success/failed',
+                `renew_expire_at` DATETIME DEFAULT NULL COMMENT '续期Token到期时间',
+                `error_message` VARCHAR(500) DEFAULT NULL COMMENT '执行结果说明或错误信息',
+                `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                PRIMARY KEY (`id`),
+                INDEX `idx_batch_id` (`batch_id`),
+                INDEX `idx_account_id` (`account_id`),
+                INDEX `idx_created_at` (`created_at`),
+                INDEX `idx_strl_created_batch` (`created_at`, `batch_id`),
+                INDEX `idx_strl_batch_created_status` (`batch_id`, `created_at`, `status`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Token续期执行日志表';
         """,
 
         # 26.2 Cookie续期计划表

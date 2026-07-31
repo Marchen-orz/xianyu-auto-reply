@@ -3,7 +3,7 @@
 
 功能：
 1. 纯 API 调 login.do，对响应做四分支编排（滑块 / 直接成功 / 触发人脸 / 失败）
-2. 滑块委托：配了远程→远程直连；否则→委托 websocket 本机真实鼠标（并发统一在 websocket）
+2. 滑块委托：配了远程→远程直连；否则→委托 WebSocket 使用其配置的滑块引擎
 3. 人脸：复用 common 人脸链路，渲染二维码供前台展示，扫码后自动收 Cookie
 4. 成功后按 account_id 入库、起 WebSocket；滑块未通过时保持协议链路重试
 
@@ -23,6 +23,7 @@ from app.services.account_service import AccountService
 from app.services.websocket_client import websocket_client
 from common.db.session import async_session_maker
 from common.services.captcha.remote_solver import solve_remote
+from common.services.token_renewal_cache_service import mark_token_cache_expired
 from common.services.xianyu_login.face_verification import (
     FaceVerificationError,
     run_face_verification_flow,
@@ -67,20 +68,13 @@ async def _read_remote_config() -> Dict[str, Any]:
     }
 
 
-def _real_mouse_enabled() -> bool:
-    """读取「真实鼠标」开关（与 orchestrator 一致）。"""
-    try:
-        return bool(getattr(get_settings(), "captcha_real_mouse_enabled", False))
-    except Exception:
-        return False
-
-
 async def _solve_slider(
     account_id: str, slider_url: str, remote_config: Dict[str, Any]
 ) -> Tuple[str, Optional[Dict[str, str]], Optional[str]]:
-    """过滑块（登录场景）：配了远程→远程（远程支持登录滑块）；否则→委托 websocket 本机真实鼠标。
+    """过滑块（登录场景）：配了远程则远程处理，否则委托 WebSocket 滑块引擎。
 
-    本机真实鼠标引擎按 URL 自动识别登录场景（加载登录轨迹 + 最大化窗口）。
+    WebSocket 服务自行根据系统设置决定使用真实鼠标或其它滑块引擎，
+    backend-web 不参与引擎选择。
 
     协议模式一旦选定过滑块通道（远程 / 本机），满足协议后【不允许跨通道回退】：
     远程超时/不可用（solve_remote 返回 'fallback'，其本意是"回退本机"）在协议语境下
@@ -104,7 +98,7 @@ async def _solve_slider(
             )
             return "fail", None, message
         return status, cookies, message
-    # 否则委托 websocket 本机真实鼠标（并发/排队统一在 websocket）
+    # 否则委托 WebSocket 滑块引擎（并发、排队和引擎选择统一在 WebSocket）
     resp = await websocket_client.solve_captcha(
         account_id=account_id, url=slider_url, call_type="local"
     )
@@ -149,14 +143,14 @@ async def _save_and_start(
             unb=unb or None,
             show_browser=show_browser,
         )
-        # 清该账号 token 缓存（可重建派生缓存，新 Cookie 需重新取 token）
+        # 标记该账号 Token 缓存失效（保留记录，新 Cookie 需重新取 Token）
         if unb:
-            from sqlalchemy import text
-
-            await session.execute(
-                text("DELETE FROM xy_token_cache WHERE user_id = :uid"), {"uid": unb}
+            invalidation = await mark_token_cache_expired(
+                token_user_id=unb,
+                invalidate_valid_cache=True,
             )
-            await session.commit()
+            if not invalidation.success:
+                logger.warning(f"【{account_id}】{invalidation.message}")
 
     # 起/重启 WebSocket（与扫码登录同一套 /internal/accounts 接口）
     try:

@@ -35,6 +35,7 @@ async def list_risk_logs(
     end_date: str | None = None,
     processing_status: str | None = None,
     call_type: str | None = None,
+    call_user: str | None = None,
     current_user: User = Depends(deps.get_current_active_user),
     risk_log_service: RiskControlLogService = Depends(deps.get_risk_log_service),
 ) -> dict:
@@ -48,6 +49,7 @@ async def list_risk_logs(
             end_date=end_date,
             processing_status=processing_status,
             call_type=call_type,
+            call_user=call_user,
             limit=limit,
             offset=offset,
         )
@@ -105,7 +107,7 @@ async def update_local_slider_config(
         await setting_service.set_setting(
             LOCAL_SLIDER_DISABLED_KEY,
             "true" if payload.enabled else "false",
-            "本机滑块是否停止处理并仅使用Token缓存",
+            "本机是否停止处理滑块；缓存缺失时仍请求Token接口",
         )
         return {
             "success": True,

@@ -32,6 +32,7 @@ open('/tmp/requirements.txt','w').write('\n'.join(deps))" && \
 
 RUN python -m playwright install --with-deps --force chrome
 RUN python -m patchright install chrome
+RUN python -m patchright install --with-deps chromium
 
 # 创建日志目录
 RUN mkdir -p /app/backend-web/logs /app/static/uploads

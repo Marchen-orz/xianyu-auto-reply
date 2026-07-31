@@ -6,11 +6,12 @@
  * 2. 支持按账号筛选
  * 3. 支持按时间范围筛选
  * 4. 支持按处理状态筛选
- * 5. 支持分页
- * 6. 支持清空日志
+ * 5. 支持按调用类型、调用用户筛选
+ * 6. 支持分页
+ * 7. 支持清空日志
  */
 import { useState, useEffect } from 'react'
-import { ShieldAlert, RefreshCw, Trash2, ChevronLeft, ChevronRight, Loader2, Calendar, Info, TrendingUp } from 'lucide-react'
+import { ShieldAlert, RefreshCw, Trash2, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Loader2, Calendar, Info, TrendingUp, Settings } from 'lucide-react'
 import { getRiskLogs, clearRiskLogs, clearProcessingRiskLogs, testRemoteSliderSolve, getRemoteCaptchaConfig, saveRemoteCaptchaConfig, getRiskTodaySuccessRate, getLocalSliderConfig, updateLocalSliderConfig, type RiskLog, type RiskTodaySuccessRate } from '@/api/admin'
 import { getAccountDetails } from '@/api/accounts'
 import { useUIStore } from '@/store/uiStore'
@@ -21,6 +22,15 @@ import { ConfirmModal } from '@/components/common/ConfirmModal'
 import { getApiErrorMessage } from '@/utils/request'
 import { getBeijingDateInputValue } from '@/utils/date'
 import type { Account } from '@/types'
+
+// Token获取方式专用域名：这些是取Token的远程接口地址，不是过滑块远程服务，禁止填到本页保存
+const TOKEN_API_ONLY_DOMAINS = ['api.xianyusite.shop', 'api.zhinianblog.cn']
+
+/** 返回远程服务URL中命中的Token接口域名，未命中返回空字符串 */
+const findTokenApiDomain = (url: string): string => {
+  const lowered = url.trim().toLowerCase()
+  return TOKEN_API_ONLY_DOMAINS.find((domain) => lowered.includes(domain)) || ''
+}
 
 export function RiskLogs() {
   const { addToast } = useUIStore()
@@ -40,6 +50,9 @@ export function RiskLogs() {
 
   // 调用类型筛选（''-全部 / local-本机 / remote-远程）
   const [selectedCallType, setSelectedCallType] = useState('')
+
+  // 调用用户筛选（模糊匹配，仅远程调用记录该字段）
+  const [callUserKeyword, setCallUserKeyword] = useState('')
 
   // 分页状态
   const [currentPage, setCurrentPage] = useState(1)
@@ -72,6 +85,8 @@ export function RiskLogs() {
   const [localSliderDisabled, setLocalSliderDisabled] = useState(false)
   const [localSliderConfigLoading, setLocalSliderConfigLoading] = useState(true)
   const [savingLocalSliderConfig, setSavingLocalSliderConfig] = useState(false)
+  // 配置卡片折叠状态（默认收起，减少页面纵向占用；标题行保留常用的"本机滑块不处理"开关）
+  const [configExpanded, setConfigExpanded] = useState(false)
 
   const getCallTypeLabel = (callType?: string | null) => (callType === 'remote' ? '远程' : '本机')
 
@@ -95,6 +110,7 @@ export function RiskLogs() {
         end_date: endDate || undefined,
         processing_status: selectedStatus || undefined,
         call_type: selectedCallType || undefined,
+        call_user: callUserKeyword.trim() || undefined,
       })
       if (result.success) {
         setLogs(result.data || [])
@@ -194,7 +210,23 @@ export function RiskLogs() {
     }
   }
 
+  /**
+   * 校验远程服务URL是否误填了Token获取接口域名，命中则提示并返回 true（保存/测试共用）
+   */
+  const rejectTokenApiUrl = (url: string): boolean => {
+    const tokenApiDomain = findTokenApiDomain(url)
+    if (!tokenApiDomain) return false
+    addToast({
+      type: 'error',
+      message: `该URL（${tokenApiDomain}）不是在此处填写，需要在「系统设置-Token获取方式」中填写`,
+    })
+    return true
+  }
+
   const handleSaveRemoteConfig = async () => {
+    // 先拦截误填的Token接口域名，避免把取Token地址存成过滑块服务地址
+    if (rejectTokenApiUrl(remoteUrl)) return
+
     const parseNonnegativeInteger = (value: string, label: string) => {
       const normalized = value.trim()
       if (!/^\d+$/.test(normalized)) {
@@ -250,6 +282,8 @@ export function RiskLogs() {
       addToast({ type: 'error', message: '请先填写远程服务URL' })
       return
     }
+    // 误填Token获取接口域名时不发起测试请求
+    if (rejectTokenApiUrl(url)) return
     try {
       setTesting(true)
       const res = await testRemoteSliderSolve(url, remoteSecret.trim())
@@ -347,15 +381,41 @@ export function RiskLogs() {
 
   return (
     <div className="space-y-4">
+      {/* 顶部红字提示：滑块验证无法通过或账号持续离线时，引导用户改用远程接口取 Token */}
+      <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 dark:border-red-500/30 dark:bg-red-500/10">
+        <p className="text-sm font-medium text-red-600 dark:text-red-400">
+          如遇滑块验证无法通过或者账号管理在线状态一直离线的场景，可到「系统设置 - 基础设置 - Token获取方式」，调整为远程接口。
+        </p>
+      </div>
+
       {/* 远程过滑块全局配置（仅管理员可见可操作） */}
       {user?.is_admin && (
       <div className="vben-card">
-        <div className="vben-card-body">
-          <div className="flex items-center justify-between gap-4 mb-4 pb-4 border-b border-slate-100 dark:border-slate-700/60">
-            <span className="text-sm font-medium text-slate-700 dark:text-slate-200">本机滑块不处理</span>
+        <div className="vben-card-body !py-3">
+          {/* 标题行：左侧折叠入口，右侧保留最常用的"本机滑块不处理"开关（收起时也可直接操作） */}
+          <div className="flex flex-wrap items-center gap-4">
             <button
               type="button"
-              onClick={handleLocalSliderConfigChange}
+              onClick={() => setConfigExpanded((v) => !v)}
+              aria-expanded={configExpanded}
+              className="flex items-center gap-2 text-sm font-medium text-slate-700 dark:text-slate-200 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
+            >
+              <Settings className="w-4 h-4 text-blue-500 dark:text-blue-400" />
+              远程过滑块配置
+              {configExpanded ? (
+                <ChevronUp className="w-4 h-4 text-slate-400 dark:text-slate-500" />
+              ) : (
+                <ChevronDown className="w-4 h-4 text-slate-400 dark:text-slate-500" />
+              )}
+              <span className="text-xs font-normal text-slate-400 dark:text-slate-500">
+                {configExpanded ? '收起' : '展开'}
+              </span>
+            </button>
+            <div className="ml-auto flex items-center gap-3">
+              <span className="text-sm font-medium text-slate-700 dark:text-slate-200">本机滑块不处理</span>
+              <button
+                type="button"
+                onClick={handleLocalSliderConfigChange}
               disabled={localSliderConfigLoading || savingLocalSliderConfig}
               role="switch"
               aria-label="本机滑块不处理"
@@ -373,8 +433,13 @@ export function RiskLogs() {
                   }`}
                 />
               )}
-            </button>
+              </button>
+            </div>
           </div>
+
+          {/* 展开后的详细配置（默认收起，减少页面纵向占用） */}
+          {configExpanded && (
+          <div className="mt-3 pt-3 border-t border-slate-100 dark:border-slate-700/60">
           {/* 配置说明提示条 */}
           <div className="flex items-start gap-2 mb-4 px-3 py-2.5 rounded-lg bg-blue-50 dark:bg-blue-500/10 border border-blue-100 dark:border-blue-500/20">
             <Info className="w-4 h-4 mt-0.5 shrink-0 text-blue-500 dark:text-blue-400" />
@@ -422,9 +487,11 @@ export function RiskLogs() {
             </button>
           </div>
 
+          {/* 两个说明型开关并排放置：宽屏一行两列、窄屏自动换行，压缩纵向占用 */}
+          <div className="mt-4 flex flex-wrap gap-x-8 gap-y-4">
           {/* 是否传递账号Cookie（默认关闭）：开启后调用远程接口时会把当前账号 Cookie 传给远程服务，
               远程端在验证链接过期时可凭 Cookie 自动重取新链接，提高成功率 */}
-          <div className="flex items-start gap-3 mt-4">
+          <div className="flex items-start gap-3 flex-1 min-w-[300px]">
             <button
               type="button"
               onClick={() => setPassCookies((v) => !v)}
@@ -448,7 +515,7 @@ export function RiskLogs() {
             </div>
           </div>
 
-          <div className="flex items-start gap-3 mt-4">
+          <div className="flex items-start gap-3 flex-1 min-w-[300px]">
             <button
               type="button"
               onClick={() => setBlockRemoteCalls((v) => !v)}
@@ -471,10 +538,12 @@ export function RiskLogs() {
               </p>
             </div>
           </div>
+          </div>
 
+          {/* 数值参数合并为一行四项（窄屏自动换行），说明文字压缩到下方两行小字 */}
           <div className="mt-4 pt-4 border-t border-slate-100 dark:border-slate-700/60">
             <div className="flex flex-wrap items-end gap-4">
-              <div className="input-group w-52 max-w-full">
+              <div className="input-group w-44 max-w-full">
                 <label className="input-label">远程处理中最大条数</label>
                 <input
                   type="number"
@@ -485,7 +554,7 @@ export function RiskLogs() {
                   className="input-ios"
                 />
               </div>
-              <div className="input-group w-52 max-w-full">
+              <div className="input-group w-44 max-w-full">
                 <label className="input-label">远程调用冷却时间（秒）</label>
                 <input
                   type="number"
@@ -496,16 +565,7 @@ export function RiskLogs() {
                   className="input-ios"
                 />
               </div>
-              <p className="flex-1 min-w-[240px] text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                默认最多允许 20 条处理中滑块日志，仅统计远程调用产生的处理中记录（不含本机）；达到上限后拒绝远程请求，并默认冷却 600 秒。填写 0 可关闭对应限制。
-              </p>
-            </div>
-          </div>
-
-          {/* real_mouse 本机/远程排队权重：本机开启真实鼠标引擎时，物理光标同一时刻只能解一个滑块，
-              本机自身任务与外部远程调用会排队。权重决定争抢时的放行比例（如 3:1），只在两边同时排队时生效。 */}
-          <div className="mt-4 pt-4 border-t border-slate-100 dark:border-slate-700/60">
-            <div className="flex flex-wrap items-end gap-4">
+              {/* real_mouse 本机/远程排队权重：物理光标同一时刻只解一个滑块，两边同时排队时按权重比例放行 */}
               <div className="input-group w-32">
                 <label className="input-label">本地排队权重</label>
                 <input
@@ -528,11 +588,14 @@ export function RiskLogs() {
                   className="input-ios"
                 />
               </div>
-              <p className="flex-1 min-w-[240px] text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                仅真实鼠标（real_mouse）过滑块引擎生效。物理光标同一时刻只解一个滑块，本地任务与外部远程调用同时排队时，按此比例放行（如 3:1 ≈ 每 4 个放 3 本地 1 远程）；一方空闲时另一方独占。默认 1:1。修改后随“保存”按钮一起生效。
-              </p>
+            </div>
+            <div className="mt-2 space-y-0.5 text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+              <p>处理中上限：默认最多允许 20 条处理中滑块日志，仅统计远程调用产生的记录（不含本机）；达到上限后拒绝远程请求，并默认冷却 600 秒，填写 0 可关闭对应限制。</p>
+              <p>排队权重：仅真实鼠标（real_mouse）引擎生效，本地任务与外部远程调用同时排队时按此比例放行（如 3:1 ≈ 每 4 个放 3 本地 1 远程），一方空闲时另一方独占，默认 1:1；修改后随“保存”按钮一起生效。</p>
             </div>
           </div>
+          </div>
+          )}
         </div>
       </div>
       )}
@@ -614,6 +677,17 @@ export function RiskLogs() {
                 <option value="local">本机</option>
                 <option value="remote">远程</option>
               </select>
+            </div>
+            <div className="input-group">
+              <label className="input-label">调用用户</label>
+              <input
+                type="text"
+                value={callUserKeyword}
+                onChange={(e) => setCallUserKeyword(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) handleSearch() }}
+                placeholder="模糊匹配，仅远程调用"
+                className="input-ios"
+              />
             </div>
             <div className="input-group min-w-[200px]">
               <label className="input-label">筛选账号</label>

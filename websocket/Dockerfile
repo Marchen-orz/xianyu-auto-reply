@@ -31,8 +31,9 @@ open('/tmp/requirements.txt','w').write('\n'.join(deps))" && \
 
 # 安装Playwright浏览器（--with-deps 自动安装系统依赖）
 RUN python -m playwright install --with-deps --force chrome
-# 安装 Patchright（指纹浏览器 / Playwright drop-in）所需的 Chrome
+# 安装 Patchright 所需的 Chrome 和 Chromium 兜底
 RUN python -m patchright install chrome
+RUN python -m patchright install --with-deps chromium
 
 # 创建日志目录
 RUN mkdir -p /app/websocket/logs /app/static /app/browser_data

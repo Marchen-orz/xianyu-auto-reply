@@ -27,6 +27,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from app.core.config import get_settings
+from common.services.captcha.slider_mode import refresh_slider_mode_from_database
+from common.services.risk_control_log_cleanup_service import (
+    fail_processing_risk_control_logs_on_restart,
+)
 from common.utils.logging_utils import setup_logging
 from common.utils.network_utils import resolve_listen_host
 
@@ -182,6 +186,16 @@ async def lifespan(app: FastAPI):
     elif not _ensure_captcha_xvfb():
         logger.error("验证码本地隐藏显示屏不可用；有头验证码会在启动时明确失败")
 
+    cleanup_result = await fail_processing_risk_control_logs_on_restart()
+    if not cleanup_result.success:
+        logger.error(cleanup_result.message)
+        raise RuntimeError(cleanup_result.message)
+    if cleanup_result.updated_count:
+        logger.warning(cleanup_result.message)
+    else:
+        logger.info(cleanup_result.message)
+
+    await refresh_slider_mode_from_database()
     # 从数据库加载日志保留天数配置
     from common.utils.logging_utils import apply_db_log_retention, run_db_log_retention_sync
     await apply_db_log_retention()

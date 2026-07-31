@@ -1,5 +1,5 @@
 """
-真实鼠标滑块求解引擎（可选，开关：环境变量 CAPTCHA_REAL_MOUSE=true）
+真实鼠标滑块求解引擎（可选，通过系统设置选择）
 
 为什么需要它：
 - 闲鱼/阿里 baxia 风控能区分「CDP 注入的鼠标事件」与「真实硬件鼠标事件」。
@@ -36,6 +36,10 @@ from loguru import logger
 
 from common.services.captcha.slider_stealth import URL_EXPIRED, CAPTCHA_NOT_REQUIRED
 from common.services.captcha.weighted_scheduler import real_mouse_scheduler
+from common.services.captcha.real_mouse_coordinates import (
+    build_geometry_mapper,
+    compute_slider_distance,
+)
 from common.services.captcha.windows_foreground import (
     activate_page_window,
     activate_window,
@@ -75,7 +79,13 @@ except ImportError:
 _PUNISH = ("punish", "x5step=2", "action=captcha", "pureCaptcha", "/captcha")
 _MAX_REPLAY_DURATION_MS = 2600.0
 _BUSINESS_SEGMENT_GAP_MS = 500.0
-_PREFERRED_BUSINESS_TRAIL = "human_trail_pass_1784203585.json"
+_PREFERRED_BUSINESS_TRAIL = "human_trail_pass_1783943859.json"
+# Existing business samples were collected on the standard 258px NC slider.
+# New samples can override this value with a top-level slider_distance field.
+_LEGACY_BUSINESS_CAPTURE_DISTANCE_PX = 258.0
+# Live replay validation showed that the captured 36-78px tails are stable,
+# while samples with tails of 83px or more consistently reduced pass rate.
+_MAX_BUSINESS_CAPTURE_OVERSHOOT_PX = 80.0
 # 真人鼠标模式专用固定目录：本地与远程请求共用，用于复用和精确识别 Chrome 进程。
 _REAL_MOUSE_BROWSER_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "browser_data", "real_mouse_shared")
@@ -96,6 +106,8 @@ class _TimedDrag(list):
         pressed_at: Optional[float] = None,
         approach=(),
         approach_to_press_ms: float = 0.0,
+        capture_distance_px: Optional[float] = None,
+        source_file: str = "",
     ):
         super().__init__(points)
         self.press_delay_ms = max(0.0, float(press_delay_ms))
@@ -105,6 +117,12 @@ class _TimedDrag(list):
         self.pressed_at = pressed_at
         self.approach = list(approach)
         self.approach_to_press_ms = max(0.0, float(approach_to_press_ms))
+        try:
+            parsed_capture_distance = float(capture_distance_px)
+        except (TypeError, ValueError):
+            parsed_capture_distance = 0.0
+        self.capture_distance_px = parsed_capture_distance if parsed_capture_distance > 0 else None
+        self.source_file = str(source_file or "")
 
 # 仅隐藏 webdriver，绝不伪造与真实 Chrome 冲突的指纹（UA/WebGL 交给真实 Chrome）
 _STEALTH_MINIMAL = """
@@ -246,16 +264,25 @@ def _load_drags(scene: str = "business") -> List[List[Tuple[float, float, float]
             )
     drags: List[List[Tuple[float, float, float]]] = []
     preferred_drag: Optional[List[Tuple[float, float, float]]] = None
+    rejected_count = 0
+    excessive_overshoot_count = 0
     for f in files:
         try:
+            with open(f, encoding="utf-8") as trail_file:
+                data = json.load(trail_file)
             if scene == "login":
-                data = json.load(open(f, encoding="utf-8"))
                 if data.get("passed") is False:
                     logger.warning(f"跳过未通过的真人轨迹样本: {f}")
                     continue
                 trail = data.get("trail", [])
             else:
-                trail = json.load(open(f, encoding="utf-8")).get("trail", [])
+                if data.get("passed") is False:
+                    rejected_count += 1
+                    continue
+                if data.get("slide_code") == 300:
+                    rejected_count += 1
+                    continue
+                trail = data.get("trail", [])
         except Exception as e:
             logger.warning(f"加载真人轨迹失败 {f}: {e}")
             continue
@@ -309,6 +336,19 @@ def _load_drags(scene: str = "business") -> List[List[Tuple[float, float, float]
                 continue
             if distance < 120 or distance > 1200:
                 continue
+            try:
+                capture_distance_px = float(
+                    data.get("slider_distance")
+                    or _LEGACY_BUSINESS_CAPTURE_DISTANCE_PX
+                )
+            except (TypeError, ValueError):
+                capture_distance_px = _LEGACY_BUSINESS_CAPTURE_DISTANCE_PX
+            capture_overshoot_px = distance - capture_distance_px
+            if capture_overshoot_px > _MAX_BUSINESS_CAPTURE_OVERSHOOT_PX:
+                excessive_overshoot_count += 1
+                continue
+        else:
+            capture_distance_px = None
         replay_drag = _TimedDrag(
             rel,
             press_delay_ms=press_delay_ms if scene == "business" else 0.0,
@@ -318,13 +358,21 @@ def _load_drags(scene: str = "business") -> List[List[Tuple[float, float, float]
             pressed_at=getattr(seg, "pressed_at", None) if scene == "business" else None,
             approach=approach,
             approach_to_press_ms=approach_to_press_ms,
+            capture_distance_px=capture_distance_px,
+            source_file=os.path.basename(f),
         )
         drags.append(replay_drag)
         if preferred and f == preferred:
             preferred_drag = replay_drag
+    if scene == "business":
+        logger.debug(
+            f"业务真人轨迹池: 可用={len(drags)}, "
+            f"未通过或code=300={rejected_count}, "
+            f"超出>{_MAX_BUSINESS_CAPTURE_OVERSHOOT_PX:.0f}px={excessive_overshoot_count}"
+        )
     if scene == "business" and preferred:
         if preferred_drag is not None:
-            return [preferred_drag]
+            return [preferred_drag] + [drag for drag in drags if drag is not preferred_drag]
         logger.warning(
             f"业务优选真人轨迹无效，回退其他业务样本: {_PREFERRED_BUSINESS_TRAIL}"
         )
@@ -357,6 +405,44 @@ def _choose_drag(drags: List[List[Tuple[float, float, float]]]) -> List[Tuple[fl
             continue
         weights.append(1.0 + min(points, 80) / 25.0 + min(duration_ms, 1800) / 900.0)
     return random.choices(drags, weights=weights, k=1)[0]
+
+
+def _take_drag(
+    remaining_drags: List[List[Tuple[float, float, float]]],
+) -> List[Tuple[float, float, float]]:
+    """Choose and remove one sample so retries do not repeat it."""
+    selected_drag = _choose_drag(remaining_drags)
+    for index, candidate in enumerate(remaining_drags):
+        if candidate is selected_drag:
+            remaining_drags.pop(index)
+            break
+    return selected_drag
+
+
+def _scale_drag_to_distance(
+    drag: List[Tuple[float, float, float]],
+    distance: float,
+) -> List[Tuple[float, float, float]]:
+    """按采集滑轨基准映射 X 位移，保留真人到底后的原始超出段。"""
+    if not drag or distance <= 0:
+        return drag
+    capture_distance = getattr(drag, "capture_distance_px", None)
+    if capture_distance is None or capture_distance <= 0:
+        capture_distance = _LEGACY_BUSINESS_CAPTURE_DISTANCE_PX
+    factor = distance / capture_distance
+    points = [(dx * factor, dy, dt) for dx, dy, dt in drag]
+    return _TimedDrag(
+        points,
+        press_delay_ms=getattr(drag, "press_delay_ms", 0.0),
+        release_delay_ms=getattr(drag, "release_delay_ms", 0.0),
+        origin_x=getattr(drag, "origin_x", None),
+        origin_y=getattr(drag, "origin_y", None),
+        pressed_at=getattr(drag, "pressed_at", None),
+        approach=getattr(drag, "approach", []),
+        approach_to_press_ms=getattr(drag, "approach_to_press_ms", 0.0),
+        capture_distance_px=capture_distance,
+        source_file=getattr(drag, "source_file", ""),
+    )
 
 
 class _RealMouseSolver:
@@ -725,6 +811,7 @@ class _RealMouseSolver:
         # 多次尝试：失败则点“重试”按钮重置滑块，再用物理鼠标滑（同页重试，最多 3 次）
         pre_x5 = self._x5sec()
         max_attempts = 3
+        remaining_drags = list(drags) if scene == "business" else []
         for attempt in range(1, max_attempts + 1):
             if time.time() - start > browser_timeout:
                 break
@@ -754,7 +841,13 @@ class _RealMouseSolver:
                 return False, None
 
             # 计算坐标 + 物理鼠标回放真人轨迹（每次随机挑一条轨迹，降低重复模式风险）
-            selected_drag = _choose_drag(drags)
+            if scene == "business":
+                if not remaining_drags:
+                    remaining_drags = list(drags)
+                selected_drag = _take_drag(remaining_drags)
+            else:
+                # Keep the existing login retry selection behavior unchanged.
+                selected_drag = _choose_drag(drags)
             if scene == "login":
                 logger.info(
                     f"【{self.pure_id}】登录滑块回放真人原始样本: "
@@ -768,8 +861,10 @@ class _RealMouseSolver:
                 press_delay_ms = getattr(selected_drag, "press_delay_ms", 0.0)
                 release_delay_ms = getattr(selected_drag, "release_delay_ms", 0.0)
                 approach = getattr(selected_drag, "approach", [])
+                source_file = getattr(selected_drag, "source_file", "") or "unknown"
                 logger.info(
                     f"【{self.pure_id}】业务滑块第{attempt}次选用真人原始轨迹: "
+                    f"样本={source_file}, "
                     f"接近点={len(approach)}, 拖动点={len(selected_drag)}, "
                     f"位移={selected_drag[-1][0]:.0f}px, "
                     f"移动={move_duration_ms:.0f}ms, "
@@ -793,7 +888,7 @@ class _RealMouseSolver:
                 if scene == "login" and cookies:
                     logger.info(f"【{self.pure_id}】登录滑块第{attempt}次回放通过")
                 # 仅当真正拿到 x5sec 才算成功；否则按失败返回
-                # （是否回退原引擎由编排层根据 CAPTCHA_REAL_MOUSE 决定，本引擎只负责返回结果）
+                # （是否回退原引擎由编排层根据系统设置决定，本引擎只负责返回结果）
                 return (True, cookies) if cookies else (False, None)
 
             # 本次未过：业务远程调用优先重新获取新鲜 URL，避免在已被风控拒绝的旧页面上
@@ -840,10 +935,20 @@ class _RealMouseSolver:
             return False
         mx = box["x"] + box["width"] / 2
         my = box["y"] + box["height"] / 2
+        replay_drag = drag
         if scene == "business":
+            distance = compute_slider_distance(frame, btn, track)
+            if distance <= 0:
+                logger.error(f"【{self.pure_id}】业务滑块无法计算当前滑轨距离")
+                return False
+            replay_drag = _scale_drag_to_distance(drag, distance)
+            overshoot = replay_drag[-1][0] - distance
             logger.info(
-                f"【{self.pure_id}】业务滑块严格回放采集位移: "
-                f"末点=({drag[-1][0]:.1f},{drag[-1][1]:.1f})px, 点数={len(drag)}"
+                f"【{self.pure_id}】业务滑块按采集滑轨基准映射真人轨迹: "
+                f"采集末点={drag[-1][0]:.1f}px, 当前到底={distance:.1f}px, "
+                f"末点=({replay_drag[-1][0]:.1f},{replay_drag[-1][1]:.1f})px, "
+                f"到底后继续={overshoot:.1f}px, "
+                f"点数={len(replay_drag)}"
             )
         else:
             track_box = track.bounding_box() if track else None
@@ -851,24 +956,18 @@ class _RealMouseSolver:
                 candidate_x = track_box["x"] + track_box["width"] - 1 - drag[-1][0]
                 if box["x"] <= candidate_x <= box["x"] + box["width"]:
                     mx = candidate_x
-        dpr = self.page.evaluate("() => window.devicePixelRatio") or 1.0
-
         if scene == "business":
-            # 业务滑块避免用 page.mouse.move 注入一次 CDP 合成移动事件；通过真实窗口几何关系
-            # 完成 CSS 视口坐标到物理屏幕坐标的映射，与测试目录验证通过的 raw 模式一致。
-            geometry = self.page.evaluate(
-                "() => ({sx: window.screenX, sy: window.screenY, ow: window.outerWidth, "
-                "oh: window.outerHeight, iw: window.innerWidth, ih: window.innerHeight})"
+            mapper, geometry = build_geometry_mapper(self.page)
+            logger.info(
+                f"【{self.pure_id}】业务滑块使用被动窗口几何映射: "
+                f"dpr={geometry.get('devicePixelRatio')}, "
+                f"窗口=({geometry.get('screenX')},{geometry.get('screenY')}), "
+                f"视口={geometry.get('innerWidth')}x{geometry.get('innerHeight')}"
             )
-            border_x = max(0.0, (geometry["ow"] - geometry["iw"]) / 2.0)
-            top_chrome = max(0.0, (geometry["oh"] - geometry["ih"]) - border_x)
-            off_x = geometry["sx"] + border_x
-            off_y = geometry["sy"] + top_chrome
-
-            def to_screen(vx: float, vy: float) -> Tuple[int, int]:
-                return int(round((off_x + vx) * dpr)), int(round((off_y + vy) * dpr))
+            to_screen = mapper.to_screen
         else:
             # 登录滑块保持原 CDP 校准逻辑，不改变 login 的滑动行为。
+            dpr = self.page.evaluate("() => window.devicePixelRatio") or 1.0
             try:
                 frame.evaluate("() => { window.__cal = []; }")
             except Exception:
@@ -899,10 +998,10 @@ class _RealMouseSolver:
         if scene == "login":
             logger.info(f"【{self.pure_id}】登录滑块使用业务同款 pyautogui 回放: 起点=({sx},{sy})")
         if scene == "business":
-            # 业务滑块严格按采集样本回放未按下接近段及完整按住段。
+            # 业务滑块保留采集样本的未按下接近段及完整按住时序。
             timer_resolution(True)
             try:
-                approach = getattr(drag, "approach", [])
+                approach = getattr(replay_drag, "approach", [])
                 if approach:
                     first_x, first_y, _ = approach[0]
                     first_sx, first_sy = to_screen(mx + first_x, my + first_y)
@@ -918,18 +1017,18 @@ class _RealMouseSolver:
                     precise_sleep(
                         approach_started
                         + approach_elapsed
-                        + getattr(drag, "approach_to_press_ms", 0.0) / 1000.0
+                        + getattr(replay_drag, "approach_to_press_ms", 0.0) / 1000.0
                     )
                 else:
                     send_move_abs(sx, sy)
                 send_button(True)
                 started = time.perf_counter()
-                press_delay = getattr(drag, "press_delay_ms", 0.0) / 1000.0
-                release_delay = getattr(drag, "release_delay_ms", 0.0) / 1000.0
+                press_delay = getattr(replay_drag, "press_delay_ms", 0.0) / 1000.0
+                release_delay = getattr(replay_drag, "release_delay_ms", 0.0) / 1000.0
                 precise_sleep(started + press_delay)
                 move_started = started + press_delay
                 elapsed = 0.0
-                for dx, dy, dt in drag:
+                for dx, dy, dt in replay_drag:
                     elapsed += dt / 1000.0
                     if dt >= 3.0:
                         precise_sleep(move_started + elapsed)
